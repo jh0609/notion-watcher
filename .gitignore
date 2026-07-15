@@ -1,0 +1,11 @@
+node_modules/
+.env
+notion-watcher-state.json
+notion-watcher-state.json.tmp
+notion-watcher.lock
+*.log
+
+# Optional custom runtime files. Keep actual values in .env local to the server.
+*.state.json
+*.state.json.tmp
+*.lock

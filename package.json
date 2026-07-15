@@ -1,0 +1,18 @@
+{
+  "name": "notion-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watch a public Notion page once and send ntfy push notifications when it changes.",
+  "main": "notion-watcher-once.js",
+  "scripts": {
+    "start": "node notion-watcher-once.js",
+    "check": "node --check notion-watcher-once.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "playwright": "^1.49.1"
+  }
+}
