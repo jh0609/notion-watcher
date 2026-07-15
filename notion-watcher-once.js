@@ -12,8 +12,11 @@ const DEFAULT_LOCK_FILE = './notion-watcher.lock';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
 const DEFAULT_MAX_TEXT_CHANGE_RATIO = 0.7;
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
-const PAGE_TIMEOUT_MS = 60 * 1000;
-const RENDER_WAIT_MS = 8 * 1000;
+const DEFAULT_PAGE_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS = 15 * 1000;
+const DEFAULT_RENDER_WAIT_MS = 8 * 1000;
+const DEFAULT_COLLECTION_WAIT_MS = 10 * 1000;
+const DEFAULT_EXTRA_WAIT_MS = 1500;
 
 const FALLBACK_CHROME_VERSION = '149.0.0.0';
 
@@ -65,6 +68,15 @@ function resolveConfig(env = process.env) {
   const minTextLength = Number.parseInt(env.MIN_TEXT_LENGTH || `${DEFAULT_MIN_TEXT_LENGTH}`, 10);
   const maxTextChangeRatio = Number.parseFloat(env.MAX_TEXT_CHANGE_RATIO || `${DEFAULT_MAX_TEXT_CHANGE_RATIO}`);
   const staleLockMs = Number.parseInt(env.STALE_LOCK_MS || `${DEFAULT_STALE_LOCK_MS}`, 10);
+  const pageTimeoutMs = parsePositiveIntegerEnv(env, 'PAGE_TIMEOUT_MS', DEFAULT_PAGE_TIMEOUT_MS);
+  const domcontentloadedTimeoutMs = parsePositiveIntegerEnv(
+    env,
+    'DOMCONTENTLOADED_TIMEOUT_MS',
+    DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS
+  );
+  const renderWaitMs = parsePositiveIntegerEnv(env, 'RENDER_WAIT_MS', DEFAULT_RENDER_WAIT_MS);
+  const collectionWaitMs = parsePositiveIntegerEnv(env, 'COLLECTION_WAIT_MS', DEFAULT_COLLECTION_WAIT_MS);
+  const extraWaitMs = parsePositiveIntegerEnv(env, 'EXTRA_WAIT_MS', DEFAULT_EXTRA_WAIT_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -84,8 +96,21 @@ function resolveConfig(env = process.env) {
     lockFile: env.LOCK_FILE || DEFAULT_LOCK_FILE,
     minTextLength,
     maxTextChangeRatio,
-    staleLockMs
+    staleLockMs,
+    pageTimeoutMs,
+    domcontentloadedTimeoutMs,
+    renderWaitMs,
+    collectionWaitMs,
+    extraWaitMs
   };
+}
+
+function parsePositiveIntegerEnv(env, name, defaultValue) {
+  const value = Number.parseInt(env[name] || `${defaultValue}`, 10);
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error(`${name}는 1 이상의 숫자여야 합니다.`);
+  }
+  return value;
 }
 
 async function pathExists(filePath) {
@@ -180,13 +205,18 @@ async function saveStateAtomic(stateFile, state) {
   await fs.rename(tempFile, absoluteStateFile);
 }
 
-async function fetchNotionPageText(notionPageUrl) {
-  const snapshot = await fetchNotionPageSnapshot(notionPageUrl);
+async function fetchNotionPageText(notionPageUrl, config = {}) {
+  const snapshot = await fetchNotionPageSnapshot(notionPageUrl, config);
   return snapshot.text;
 }
 
-async function fetchNotionPageSnapshot(notionPageUrl) {
+async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
   let browser;
+  const pageTimeoutMs = config.pageTimeoutMs || DEFAULT_PAGE_TIMEOUT_MS;
+  const domcontentloadedTimeoutMs = config.domcontentloadedTimeoutMs || DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS;
+  const renderWaitMs = config.renderWaitMs || DEFAULT_RENDER_WAIT_MS;
+  const collectionWaitMs = config.collectionWaitMs || DEFAULT_COLLECTION_WAIT_MS;
+  const extraWaitMs = config.extraWaitMs || DEFAULT_EXTRA_WAIT_MS;
 
   try {
     const { chromium } = require('playwright');
@@ -202,32 +232,32 @@ async function fetchNotionPageSnapshot(notionPageUrl) {
       }
     });
     const page = await context.newPage();
-    page.setDefaultTimeout(PAGE_TIMEOUT_MS);
+    page.setDefaultTimeout(pageTimeoutMs);
 
     log('INFO', '페이지 접속을 시작합니다.');
     await page.goto(notionPageUrl, {
       waitUntil: 'commit',
-      timeout: PAGE_TIMEOUT_MS
+      timeout: pageTimeoutMs
     });
 
     await page.waitForLoadState('domcontentloaded', {
-      timeout: 15000
+      timeout: domcontentloadedTimeoutMs
     }).catch(() => null);
 
     await Promise.race([
       page.waitForSelector('[data-block-id], .notion-page-content, main, article', {
         state: 'attached',
-        timeout: RENDER_WAIT_MS
+        timeout: renderWaitMs
       }).catch(() => null),
-      page.waitForTimeout(RENDER_WAIT_MS)
+      page.waitForTimeout(renderWaitMs)
     ]);
 
     await page.waitForSelector('.notion-collection-item', {
       state: 'attached',
-      timeout: 10000
+      timeout: collectionWaitMs
     }).catch(() => null);
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(extraWaitMs);
 
     const snapshot = await extractPageSnapshot(page);
     const title = await page.title().catch(() => '');
@@ -498,9 +528,9 @@ async function runOnce(options = {}) {
     let snapshot;
     try {
       if (deps.fetchPageSnapshot) {
-        snapshot = await deps.fetchPageSnapshot(config.notionPageUrl);
+        snapshot = await deps.fetchPageSnapshot(config.notionPageUrl, config);
       } else {
-        snapshot = { text: await deps.fetchPageText(config.notionPageUrl), tableText: '' };
+        snapshot = { text: await deps.fetchPageText(config.notionPageUrl, config), tableText: '' };
       }
     } catch (error) {
       log('ERROR', '페이지 접근 실패');
@@ -580,7 +610,7 @@ async function runOnce(options = {}) {
       log('ERROR', error.message);
     } else if (/ntfy/.test(error.message)) {
       log('ERROR', error.message);
-    } else if (/필수 환경변수|MIN_TEXT_LENGTH|MAX_TEXT_CHANGE_RATIO|STALE_LOCK_MS/.test(error.message)) {
+    } else if (/필수 환경변수|MIN_TEXT_LENGTH|MAX_TEXT_CHANGE_RATIO|STALE_LOCK_MS|TIMEOUT_MS|WAIT_MS/.test(error.message)) {
       log('ERROR', error.message);
     } else if (/페이지 조회|본문/.test(error.message)) {
       log('ERROR', error.message);
@@ -632,5 +662,10 @@ module.exports = {
   createDesktopUserAgent,
   DEFAULT_MIN_TEXT_LENGTH,
   DEFAULT_MAX_TEXT_CHANGE_RATIO,
-  DEFAULT_STALE_LOCK_MS
+  DEFAULT_STALE_LOCK_MS,
+  DEFAULT_PAGE_TIMEOUT_MS,
+  DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS,
+  DEFAULT_RENDER_WAIT_MS,
+  DEFAULT_COLLECTION_WAIT_MS,
+  DEFAULT_EXTRA_WAIT_MS
 };

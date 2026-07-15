@@ -45,11 +45,26 @@ NTFY_TOPIC=notion-watch-3d9f2c8a7b1e4f6d9a2c
 STATE_FILE=./notion-watcher-state.json
 LOCK_FILE=./notion-watcher.lock
 MAX_TEXT_CHANGE_RATIO=0.7
+PAGE_TIMEOUT_MS=60000
+DOMCONTENTLOADED_TIMEOUT_MS=15000
+RENDER_WAIT_MS=8000
+COLLECTION_WAIT_MS=10000
+EXTRA_WAIT_MS=1500
 ```
 
 `NOTION_PAGE_URL`과 `NTFY_TOPIC`은 필수입니다. `NTFY_SERVER_URL` 기본값은 `https://ntfy.sh`, `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
 `MAX_TEXT_CHANGE_RATIO`는 이전 본문과 현재 본문의 길이 차이가 너무 클 때 추출 실패로 보고 상태를 갱신하지 않는 보호장치입니다. 기본값 `0.7`은 길이 변화가 70%를 넘으면 오류로 처리합니다.
+
+느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
+
+- `PAGE_TIMEOUT_MS`: 페이지 첫 응답 대기 시간, 기본 `60000`
+- `DOMCONTENTLOADED_TIMEOUT_MS`: `domcontentloaded` 이벤트 추가 대기 시간, 기본 `15000`
+- `RENDER_WAIT_MS`: Notion 본문 DOM 대기 시간, 기본 `8000`
+- `COLLECTION_WAIT_MS`: 상품 카드 `.notion-collection-item` 대기 시간, 기본 `10000`
+- `EXTRA_WAIT_MS`: 추출 직전 마지막 고정 대기 시간, 기본 `1500`
+
+상품 표가 늦게 렌더링되는 서버라면 예를 들어 `COLLECTION_WAIT_MS=30000`, `EXTRA_WAIT_MS=3000`처럼 늘릴 수 있습니다.
 
 공개 Notion 페이지가 아니거나 로그인이 필요한 페이지라면 정상 본문으로 처리되지 않을 수 있습니다.
 
