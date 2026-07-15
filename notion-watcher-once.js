@@ -360,6 +360,22 @@ function createHash(normalizedText) {
   return crypto.createHash('sha256').update(normalizedText, 'utf8').digest('hex');
 }
 
+function formatKstDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Seoul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(date);
+  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${byType.year}-${byType.month}-${byType.day} ${byType.hour}:${byType.minute}:${byType.second} KST`;
+}
+
 function createTableDiff(previousTableText, currentTableText) {
   const previousLines = normalizeText(previousTableText || '').split('\n').filter(Boolean);
   const currentLines = normalizeText(currentTableText || '').split('\n').filter(Boolean);
@@ -413,10 +429,11 @@ function isSuspiciousTextSizeChange(previousText, currentText, maxTextChangeRati
 
 async function sendNtfyNotification(config, checkedAt, previousTextLength, currentTextLength, tableDiff = '') {
   const url = `${config.ntfyServerUrl}/${encodeURIComponent(config.ntfyTopic)}`;
+  const checkedAtText = formatKstDateTime(checkedAt);
   const body = [
     '감시 중인 Notion 페이지가 업데이트되었습니다.',
     '',
-    `확인 시각: ${checkedAt}`,
+    `확인 시각: ${checkedAtText}`,
     `이전 본문 길이: ${previousTextLength}자`,
     `현재 본문 길이: ${currentTextLength}자`,
     '',
@@ -606,6 +623,7 @@ module.exports = {
   fetchNotionPageSnapshot,
   normalizeText,
   createHash,
+  formatKstDateTime,
   createTableDiff,
   isSuspiciousTextSizeChange,
   sendNtfyNotification,
