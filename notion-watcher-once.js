@@ -356,6 +356,7 @@ async function extractPageSnapshot(page) {
 
     return {
       text,
+      updateText: updateText || '',
       tableText
     };
   });
@@ -388,6 +389,34 @@ function normalizeText(text) {
 
 function createHash(normalizedText) {
   return crypto.createHash('sha256').update(normalizedText, 'utf8').digest('hex');
+}
+
+function getChangeKey(hash, updateText) {
+  const normalizedUpdateText = normalizeText(updateText || '');
+  if (normalizedUpdateText) {
+    return {
+      changeKey: `update:${normalizedUpdateText}`,
+      changeKeyType: 'updateText'
+    };
+  }
+  return {
+    changeKey: `hash:${hash}`,
+    changeKeyType: 'hash'
+  };
+}
+
+function extractUpdateTextFromText(text) {
+  const normalized = normalizeText(text || '');
+  const matched = normalized.match(/업데이트\s+Update\s*-\s*\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\s+\d{1,2}:\d{2}/i);
+  return matched ? matched[0].replace(/\s+/g, ' ').trim() : '';
+}
+
+function getPreviousChangeKey(previousState) {
+  if (!previousState) return '';
+  if (previousState.changeKey) return previousState.changeKey;
+  const previousUpdateText = previousState.updateText || extractUpdateTextFromText(previousState.text);
+  if (previousUpdateText) return getChangeKey(previousState.hash || '', previousUpdateText).changeKey;
+  return `hash:${previousState.hash}`;
 }
 
 function formatKstDateTime(value) {
@@ -539,6 +568,7 @@ async function runOnce(options = {}) {
 
     const normalizedText = normalizeText(snapshot.text);
     const normalizedTableText = normalizeText(snapshot.tableText || '');
+    const normalizedUpdateText = normalizeText(snapshot.updateText || '');
     if (normalizedText.length < config.minTextLength) {
       log('ERROR', '추출된 페이지 본문이 너무 짧아 정상적인 페이지로 판단할 수 없습니다.');
       throw new Error('추출된 페이지 본문이 너무 짧아 정상적인 페이지로 판단할 수 없습니다.');
@@ -546,6 +576,7 @@ async function runOnce(options = {}) {
 
     log('INFO', '본문 추출에 성공했습니다.');
     const hash = createHash(normalizedText);
+    const { changeKey, changeKeyType } = getChangeKey(hash, normalizedUpdateText);
     const checkedAt = deps.now().toISOString();
 
     let previousState;
@@ -559,6 +590,9 @@ async function runOnce(options = {}) {
     if (!previousState) {
       await saveStateWithLog(config.stateFile, {
         hash,
+        changeKey,
+        changeKeyType,
+        updateText: normalizedUpdateText,
         text: normalizedText,
         tableText: normalizedTableText,
         checkedAt,
@@ -573,10 +607,14 @@ async function runOnce(options = {}) {
       throw new Error('추출된 페이지 본문 길이 변화가 비정상적으로 커서 정상적인 페이지로 판단할 수 없습니다.');
     }
 
-    if (previousState.hash === hash) {
+    const previousChangeKey = getPreviousChangeKey(previousState);
+    if (previousChangeKey === changeKey) {
       await saveStateWithLog(config.stateFile, {
         ...previousState,
         hash,
+        changeKey,
+        changeKeyType,
+        updateText: normalizedUpdateText,
         text: normalizedText,
         tableText: normalizedTableText,
         checkedAt,
@@ -598,6 +636,9 @@ async function runOnce(options = {}) {
 
     await saveStateWithLog(config.stateFile, {
       hash,
+      changeKey,
+      changeKeyType,
+      updateText: normalizedUpdateText,
       text: normalizedText,
       tableText: normalizedTableText,
       checkedAt,
@@ -653,6 +694,9 @@ module.exports = {
   fetchNotionPageSnapshot,
   normalizeText,
   createHash,
+  getChangeKey,
+  getPreviousChangeKey,
+  extractUpdateTextFromText,
   formatKstDateTime,
   createTableDiff,
   isSuspiciousTextSizeChange,
