@@ -42,6 +42,7 @@ npx playwright install --with-deps chromium
 NOTION_PAGE_URL=https://www.notion.so/...
 NTFY_SERVER_URL=https://ntfy.sh
 NTFY_TOPIC=notion-watch-3d9f2c8a7b1e4f6d9a2c
+NTFY_TOKEN=tk_xxxxxxxxxxxxxxxxx
 STATE_FILE=./notion-watcher-state.json
 LOCK_FILE=./notion-watcher.lock
 MAX_TEXT_CHANGE_RATIO=0.7
@@ -52,7 +53,7 @@ COLLECTION_WAIT_MS=10000
 EXTRA_WAIT_MS=1500
 ```
 
-`NOTION_PAGE_URL`과 `NTFY_TOPIC`은 필수입니다. `NTFY_SERVER_URL` 기본값은 `https://ntfy.sh`, `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
+`NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
 `MAX_TEXT_CHANGE_RATIO`는 이전 본문과 현재 본문의 길이 차이가 너무 클 때 추출 실패로 보고 상태를 갱신하지 않는 보호장치입니다. 기본값 `0.7`은 길이 변화가 70%를 넘으면 오류로 처리합니다.
 
@@ -72,6 +73,8 @@ EXTRA_WAIT_MS=1500
 
 휴대폰에 ntfy 앱을 설치하고 `.env`의 `NTFY_TOPIC`과 같은 토픽을 구독합니다. 공개 ntfy 서버의 토픽은 URL을 아는 사람이 접근할 수 있으므로 `notion`, `my-page`, 이름, 이메일 같은 단순하거나 개인정보가 포함된 토픽명을 사용하지 마세요. 충분히 긴 무작위 문자열을 붙인 토픽명을 사용하세요.
 
+알림 발송은 익명 발송이 아니라 `NTFY_TOKEN` Bearer 인증을 사용합니다. 토큰 값은 `.env`에만 저장하고 로그, README, `.env.example`에는 실제 값을 넣지 마세요.
+
 무작위 토픽명 생성 예시:
 
 ```bash
@@ -83,6 +86,7 @@ watcher 실행 전에 ntfy 알림을 먼저 테스트할 수 있습니다.
 ```bash
 curl \
   -H "Title: Notion 알림 테스트" \
+  -H "Authorization: Bearer 본인의-ntfy-액세스-토큰" \
   -H "Priority: high" \
   -H "Tags: memo,eyes" \
   -d "ntfy 푸시 알림 테스트입니다." \

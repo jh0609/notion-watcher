@@ -6,7 +6,6 @@ const crypto = require('crypto');
 const fs = require('fs/promises');
 const path = require('path');
 
-const DEFAULT_NTFY_SERVER_URL = 'https://ntfy.sh';
 const DEFAULT_STATE_FILE = './notion-watcher-state.json';
 const DEFAULT_LOCK_FILE = './notion-watcher.lock';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
@@ -59,7 +58,9 @@ function log(level, message) {
 function resolveConfig(env = process.env) {
   const missing = [];
   if (!env.NOTION_PAGE_URL) missing.push('NOTION_PAGE_URL');
+  if (!env.NTFY_SERVER_URL) missing.push('NTFY_SERVER_URL');
   if (!env.NTFY_TOPIC) missing.push('NTFY_TOPIC');
+  if (!env.NTFY_TOKEN) missing.push('NTFY_TOKEN');
 
   if (missing.length > 0) {
     throw new Error(`필수 환경변수가 누락되었습니다: ${missing.join(', ')}`);
@@ -90,8 +91,9 @@ function resolveConfig(env = process.env) {
 
   return {
     notionPageUrl: env.NOTION_PAGE_URL,
-    ntfyServerUrl: (env.NTFY_SERVER_URL || DEFAULT_NTFY_SERVER_URL).replace(/\/+$/, ''),
+    ntfyServerUrl: env.NTFY_SERVER_URL.replace(/\/+$/, ''),
     ntfyTopic: env.NTFY_TOPIC,
+    ntfyToken: env.NTFY_TOKEN,
     stateFile: env.STATE_FILE || DEFAULT_STATE_FILE,
     lockFile: env.LOCK_FILE || DEFAULT_LOCK_FILE,
     minTextLength,
@@ -504,6 +506,7 @@ async function sendNtfyNotification(config, checkedAt, previousTextLength, curre
     method: 'POST',
     headers: {
       Title: encodeHeaderValue('Notion 페이지 업데이트'),
+      Authorization: `Bearer ${config.ntfyToken}`,
       Priority: 'high',
       Tags: 'memo,eyes',
       Click: config.notionPageUrl,
@@ -519,8 +522,11 @@ async function sendNtfyNotification(config, checkedAt, previousTextLength, curre
     } catch {
       responseText = '';
     }
+    const authHint = response.status === 401 || response.status === 403
+      ? ' 인증 또는 ACL 설정을 확인하세요.'
+      : '';
     const detail = responseText ? ` 응답: ${responseText.slice(0, 500)}` : '';
-    throw new Error(`ntfy 응답 상태 ${response.status}.${detail}`);
+    throw new Error(`ntfy 응답 상태 ${response.status}.${authHint}${detail}`);
   }
 }
 
