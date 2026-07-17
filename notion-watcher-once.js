@@ -303,17 +303,8 @@ async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
 
   try {
     const { chromium } = require('playwright');
-    browser = await chromium.launch({ headless: true });
-    const chromeVersion = browser.version() || FALLBACK_CHROME_VERSION;
-    const context = await browser.newContext({
-      userAgent: createDesktopUserAgent(chromeVersion),
-      viewport: { width: 1365, height: 900 },
-      locale: 'ko-KR',
-      extraHTTPHeaders: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
-      }
-    });
+    browser = await chromium.launch(getChromiumLaunchOptions());
+    const context = await browser.newContext(getBrowserContextOptions(browser));
     const page = await context.newPage();
     page.setDefaultTimeout(pageLoadTimeoutMs);
 
@@ -446,6 +437,38 @@ async function extractPageSnapshot(page) {
       tableText,
       renderedCandidateCount: scored.length + collectionItems.length
     };
+  });
+}
+
+function getChromiumLaunchOptions() {
+  return { headless: true };
+}
+
+function getBrowserContextOptions(browser) {
+  const chromeVersion = browser.version() || FALLBACK_CHROME_VERSION;
+  return {
+    userAgent: createDesktopUserAgent(chromeVersion),
+    viewport: { width: 1365, height: 900 },
+    locale: 'ko-KR',
+    extraHTTPHeaders: {
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
+  };
+}
+
+function attachPageDiagnostics(page, label = 'main-page') {
+  page.on('pageerror', (error) => log('ERROR', `[${label}] pageerror: ${error.message}`));
+  page.on('console', (message) => {
+    if (message.type() === 'error' || message.type() === 'warning') {
+      log(message.type() === 'error' ? 'ERROR' : 'WARN', `[${label}] console ${message.type()}: ${message.text()}`);
+    }
+  });
+  page.on('requestfailed', (request) => {
+    log('WARN', `[${label}] requestfailed: ${request.url()} (${request.failure()?.errorText || 'unknown error'})`);
+  });
+  page.on('response', (response) => {
+    if (response.status() >= 400) log('WARN', `[${label}] HTTP ${response.status()}: ${response.url()}`);
   });
 }
 
@@ -1030,7 +1053,11 @@ async function getCollectionRenderStats(page) {
     collectionItemAnchorCount: document.querySelectorAll('.notion-collection-item a[href]').length,
     dataBlockIdCount: document.querySelectorAll('.notion-collection-item[data-block-id], .notion-collection-item [data-block-id]').length,
     bodyTextLength: (document.body?.innerText || '').length,
-    currentUrl: location.href
+    bodyTextPreview: (document.body?.innerText || '').slice(0, 1000),
+    currentUrl: location.href,
+    documentReadyState: document.readyState,
+    navigatorUserAgent: navigator.userAgent,
+    navigatorWebdriver: navigator.webdriver
   }));
 }
 
@@ -1238,11 +1265,16 @@ async function extractProductDetail(page, url) {
 
 async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
   const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
+  const failedHtmlPath = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR, 'main-page-failed.html');
+  await removeFileIfExists(failedHtmlPath);
   let lastError;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const context = await browser.newContext({ locale: 'ko-KR' });
+    const context = await browser.newContext(getBrowserContextOptions(browser));
+    let page;
     try {
-      const page = await context.newPage();
+      page = await context.newPage();
+      attachPageDiagnostics(page, `main-page attempt ${attempt}/${maxAttempts}`);
+      log('INFO', 'request interception/resource blocking: disabled (script, xhr, fetch allowed)');
       await page.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
       await waitForProductCards(page, config.collectionWaitMs);
       await page.waitForTimeout(config.extraWaitMs);
@@ -1253,6 +1285,18 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
       return result;
     } catch (error) {
       lastError = createPageFetchError(error);
+      const stats = page ? await getCollectionRenderStats(page).catch(() => ({})) : {};
+      log('WARN', `메인 페이지 실패 본문 앞 1000자: ${JSON.stringify(stats.bodyTextPreview || '')}`);
+      if (Object.keys(stats).length) log('WARN', `메인 페이지 실패 DOM 통계: ${JSON.stringify(stats)}`);
+      if (attempt === maxAttempts && page) {
+        try {
+          await fs.mkdir(path.dirname(failedHtmlPath), { recursive: true });
+          await fs.writeFile(failedHtmlPath, await page.content(), 'utf8');
+          log('INFO', `마지막 실패 HTML 저장: ${failedHtmlPath}`);
+        } catch (saveError) {
+          log('WARN', `마지막 실패 HTML 저장 실패: ${saveError.message}`);
+        }
+      }
       log('WARN', `메인 페이지 조회 ${attempt}/${maxAttempts} 실패: ${lastError.message}`);
       if (attempt < maxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
     } finally {
@@ -1264,7 +1308,7 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
 
 async function fetchProductCatalog(notionPageUrl, config = {}) {
   const { chromium } = require('playwright');
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch(getChromiumLaunchOptions());
   try {
     const { urls } = await discoverProductUrlsWithRetries(browser, notionPageUrl, config);
     if (!urls.length) throw new PageFetchError('product detail URLs not found');
@@ -1278,7 +1322,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
         const url = urls[index];
         let lastError;
         for (let attempt = 1; attempt <= config.pageFetchMaxAttempts; attempt += 1) {
-          const context = await browser.newContext({ locale: 'ko-KR' });
+          const context = await browser.newContext(getBrowserContextOptions(browser));
           try {
             const page = await context.newPage();
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
@@ -1311,10 +1355,12 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
 
 async function debugCards(config = resolveDebugConfig()) {
   const { chromium } = require('playwright');
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch(getChromiumLaunchOptions());
   try {
-    const context = await browser.newContext({ locale: 'ko-KR', viewport: { width: 1365, height: 900 } });
+    const context = await browser.newContext(getBrowserContextOptions(browser));
     const page = await context.newPage();
+    attachPageDiagnostics(page, 'debug-cards');
+    log('INFO', 'request interception/resource blocking: disabled (script, xhr, fetch allowed)');
     await page.goto(config.notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
     await waitForProductCards(page, config.collectionWaitMs);
     await page.waitForTimeout(config.extraWaitMs);
@@ -1524,6 +1570,9 @@ module.exports = {
   runOnce,
   isLockStaleOrInvalid,
   createDesktopUserAgent,
+  getChromiumLaunchOptions,
+  getBrowserContextOptions,
+  attachPageDiagnostics,
   DEFAULT_MIN_TEXT_LENGTH,
   DEFAULT_DETAIL_CONCURRENCY,
   MIN_PRODUCT_COUNT,
