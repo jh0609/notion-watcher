@@ -8,7 +8,7 @@ const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards,
-  attachPageDiagnostics, runOnce
+  attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -141,6 +141,43 @@ test('운영 페이지 진단은 노이즈를 제외하고 중요한 오류를 �
   assert.equal(diagnostics.entries.length, 2);
   assert.match(diagnostics.entries[0].message, /loadPageChunk/);
   assert.match(diagnostics.entries[1].message, /renderer failure/);
+});
+
+test('상세 리소스 차단은 image, media, font에만 적용한다', () => {
+  assert.deepEqual(['image', 'media', 'font'].map(shouldAbortDetailResource), [true, true, true]);
+  assert.deepEqual(
+    ['document', 'script', 'xhr', 'fetch', 'stylesheet'].map(shouldAbortDetailResource),
+    [false, false, false, false, false]
+  );
+});
+
+test('상세 context 정책은 차단 대상은 abort하고 필수 리소스는 continue한다', async () => {
+  let handler;
+  await configureDetailResourcePolicy({ route: async (pattern, callback) => {
+    assert.equal(pattern, '**/*');
+    handler = callback;
+  } });
+  const decisions = [];
+  for (const type of ['image', 'script', 'xhr', 'fetch', 'stylesheet']) {
+    await handler({
+      request: () => ({ resourceType: () => type }),
+      abort: async () => decisions.push(`${type}:abort`),
+      continue: async () => decisions.push(`${type}:continue`)
+    });
+  }
+  assert.deepEqual(decisions, [
+    'image:abort', 'script:continue', 'xhr:continue', 'fetch:continue', 'stylesheet:continue'
+  ]);
+});
+
+test('리소스 차단 적용 전후의 텍스트 본문 파싱 결과는 동일하다', () => {
+  const title = '캐릭터 아크릴 스탠드';
+  const text = '캐릭터 아크릴 스탠드 19,000원 판매 중 (FOR SALE) 고나래 (판매 중) 김준호 (품절)';
+  const beforeBlocking = parseProductText(title, text);
+  const afterBlocking = parseProductText(title, text);
+  assert.deepEqual(afterBlocking, beforeBlocking);
+  assert.equal(afterBlocking.price, '19,000원');
+  assert.equal(afterBlocking.status, '판매 중');
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {

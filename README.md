@@ -56,6 +56,8 @@ OPERATION_STATE_FILE=./notion-watcher-operation-state.json
 LOCK_FILE=./notion-watcher.lock
 SNAPSHOT_DIR=./snapshots
 DETAIL_CONCURRENCY=2
+DETAIL_NAVIGATION_TIMEOUT_MS=20000
+DETAIL_READY_TIMEOUT_MS=10000
 DEBUG_DOM=false
 DEBUG_DIR=./debug
 DEBUG_SAVE_SCREENSHOTS=false
@@ -72,6 +74,8 @@ OPERATOR_NTFY_TOPIC=
 `NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `OPERATION_STATE_FILE` 기본값은 `./notion-watcher-operation-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
 `SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 기본값은 `2`입니다.
+
+상세 조회는 하나의 전용 BrowserContext를 공유하고 worker별 page를 재사용합니다. `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 허용합니다. Service Worker는 차단됩니다. `DETAIL_NAVIGATION_TIMEOUT_MS` 기본값은 `20000`, 가격과 판매 상태가 나타날 때까지 기다리는 `DETAIL_READY_TIMEOUT_MS` 기본값은 `10000`입니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 

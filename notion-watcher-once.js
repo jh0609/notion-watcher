@@ -12,6 +12,8 @@ const DEFAULT_OPERATION_STATE_FILE = './notion-watcher-operation-state.json';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
 const DEFAULT_SNAPSHOT_DIR = './snapshots';
 const DEFAULT_DETAIL_CONCURRENCY = 2;
+const DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS = 20 * 1000;
+const DEFAULT_DETAIL_READY_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
@@ -119,6 +121,10 @@ function resolveConfig(env = process.env) {
     DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS
   );
   const detailConcurrency = parsePositiveIntegerEnv(env, 'DETAIL_CONCURRENCY', DEFAULT_DETAIL_CONCURRENCY);
+  const detailNavigationTimeoutMs = parsePositiveIntegerEnv(
+    env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS
+  );
+  const detailReadyTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -143,6 +149,8 @@ function resolveConfig(env = process.env) {
     debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR,
     debugSaveScreenshots: parseBooleanEnv(env.DEBUG_SAVE_SCREENSHOTS),
     detailConcurrency,
+    detailNavigationTimeoutMs,
+    detailReadyTimeoutMs,
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -1267,26 +1275,46 @@ async function collectProductUrls(page, mainUrl) {
   return { urls: [...urls.values()], diagnostics, candidates, clickResults };
 }
 
-async function extractProductDetail(page, url) {
-  const raw = await page.evaluate(() => {
-    const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
-    const title = clean(document.querySelector('h1, [contenteditable="true"][data-content-editable-leaf="true"]')?.textContent) || clean(document.title).replace(/\s*[|–-]\s*Notion.*$/i, '');
-    const text = clean(document.querySelector('.notion-page-content, main, article')?.innerText || document.body.innerText);
-    const price = text.match(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/)?.[0] || '';
-    const status = text.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i)?.[0] || '';
-    const characters = [];
-    const pattern = /([^|\n,()]{1,80}?)\s*\((판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\)/gi;
-    let match;
-    while ((match = pattern.exec(text))) characters.push({ name: clean(match[1]), status: clean(match[2]) });
-    document.querySelectorAll('tr, [role="row"], .notion-toggle-block, details').forEach((row) => {
-      const rowText = clean(row.innerText || row.textContent);
-      const rowStatus = rowText.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i)?.[0];
-      if (!rowStatus) return;
-      const name = clean(rowText.replace(rowStatus, '').replace(/[|:()]/g, ' '));
-      if (name && name !== title && name.length <= 80) characters.push({ name, status: rowStatus });
-    });
-    return { name: title, price, status, characters, text };
+function shouldAbortDetailResource(resourceType) {
+  return resourceType === 'image' || resourceType === 'media' || resourceType === 'font';
+}
+
+async function configureDetailResourcePolicy(context) {
+  await context.route('**/*', async (route) => {
+    if (shouldAbortDetailResource(route.request().resourceType())) await route.abort();
+    else await route.continue();
   });
+}
+
+function parseProductText(title, text, rowTexts = []) {
+  const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
+  const name = clean(title).replace(/\s*[|–-]\s*Notion.*$/i, '');
+  const normalizedText = clean(text);
+  const price = normalizedText.match(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/)?.[0] || '';
+  const statusPattern = /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i;
+  const status = normalizedText.match(statusPattern)?.[0] || '';
+  const characters = [];
+  const optionPattern = /([^|\n,()]{1,80}?)\s*\((판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\)/gi;
+  let match;
+  while ((match = optionPattern.exec(normalizedText))) characters.push({ name: clean(match[1]), status: clean(match[2]) });
+  rowTexts.forEach((value) => {
+    const rowText = clean(value);
+    const rowStatus = rowText.match(statusPattern)?.[0];
+    if (!rowStatus) return;
+    const characterName = clean(rowText.replace(rowStatus, '').replace(/[|:()]/g, ' '));
+    if (characterName && characterName !== name && characterName.length <= 80) characters.push({ name: characterName, status: rowStatus });
+  });
+  return { name, price, status, characters, text: normalizedText };
+}
+
+async function extractProductDetail(page, url) {
+  const source = await page.evaluate(() => ({
+    title: document.querySelector('h1, [contenteditable="true"][data-content-editable-leaf="true"]')?.textContent || document.title,
+    text: document.querySelector('.notion-page-content, main, article')?.innerText || document.body.innerText,
+    rowTexts: [...document.querySelectorAll('tr, [role="row"], .notion-toggle-block, details')]
+      .map((row) => row.innerText || row.textContent || '')
+  }));
+  const raw = parseProductText(source.title, source.text, source.rowTexts);
   assertNotionContentLooksUsable({ url: page.url(), title: raw.name, text: raw.text, renderedCandidateCount: 1 });
   if (!raw.name) throw new PageFetchError('product name not found');
   if (EXTERNAL_SERVICE_TITLE_PATTERNS.some((pattern) => pattern.test(raw.name))) {
@@ -1353,45 +1381,61 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     const failures = [];
     const detailConcurrency = Math.min(config.detailConcurrency || DEFAULT_DETAIL_CONCURRENCY, urls.length);
     const detailStartedAt = Date.now();
+    const detailDurationsMs = [];
     log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
+    const detailContext = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
+    await configureDetailResourcePolicy(detailContext);
     let cursor = 0;
     const worker = async () => {
-      while (cursor < urls.length) {
-        const index = cursor++;
-        const url = urls[index];
-        const position = index + 1;
-        log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url}`);
-        let lastError;
-        const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
-        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-          let context;
-          try {
-            context = await browser.newContext(getBrowserContextOptions(browser));
-            const page = await context.newPage();
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
-            await page.waitForSelector('.notion-page-content, main, article', { timeout: config.renderWaitMs });
-            await page.waitForTimeout(config.extraWaitMs);
-            products[index] = await extractProductDetail(page, url);
-            lastError = null;
-            log('INFO', `상세 페이지 조회 ${position}/${urls.length} 완료: ${products[index].name}`);
-            break;
-          } catch (error) {
-            lastError = createPageFetchError(error);
-            if (attempt < config.pageFetchMaxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
-          } finally {
-            if (context) await context.close().catch(() => undefined);
+      const page = await detailContext.newPage();
+      try {
+        while (cursor < urls.length) {
+          const index = cursor++;
+          const url = urls[index];
+          const position = index + 1;
+          const productStartedAt = Date.now();
+          log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url}`);
+          let lastError;
+          const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
+          for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            try {
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS });
+              await page.waitForFunction(() => {
+                const text = document.body?.innerText || '';
+                return (/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text) &&
+                  /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text));
+              }, null, { timeout: config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS });
+              products[index] = await extractProductDetail(page, url);
+              lastError = null;
+              const durationMs = Date.now() - productStartedAt;
+              detailDurationsMs.push(durationMs);
+              log('INFO', `상세 페이지 조회 ${position}/${urls.length} 완료: ${products[index].name} (${(durationMs / 1000).toFixed(1)}초)`);
+              break;
+            } catch (error) {
+              lastError = createPageFetchError(error);
+              if (attempt < maxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
+            }
+          }
+          if (lastError) {
+            const durationMs = Date.now() - productStartedAt;
+            detailDurationsMs.push(durationMs);
+            const reason = lastError.reason || lastError.message || 'unknown error';
+            failures.push({ url, reason });
+            log('WARN', `상세 페이지 조회 ${position}/${urls.length} 실패: ${reason} (${(durationMs / 1000).toFixed(1)}초)`);
           }
         }
-        if (lastError) {
-          const reason = lastError.reason || lastError.message || 'unknown error';
-          failures.push({ url, reason });
-          log('WARN', `상세 페이지 조회 ${position}/${urls.length} 실패: ${reason}`);
-        }
+      } finally {
+        await page.close().catch(() => undefined);
       }
     };
-    await Promise.all(Array.from({ length: detailConcurrency }, worker));
+    try {
+      await Promise.all(Array.from({ length: detailConcurrency }, worker));
+    } finally {
+      await detailContext.close().catch(() => undefined);
+    }
     const elapsedMs = Date.now() - detailStartedAt;
-    log('INFO', `전체 상세 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초`);
+    const averageMs = detailDurationsMs.length ? detailDurationsMs.reduce((sum, value) => sum + value, 0) / detailDurationsMs.length : 0;
+    log('INFO', `전체 상세 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초, 상품 평균 ${(averageMs / 1000).toFixed(1)}초`);
     if (failures.length) {
       const error = new PageFetchError('product detail fetch failed', failures.map((item) => item.url).join(', '));
       error.failures = failures;
@@ -1612,6 +1656,9 @@ module.exports = {
   waitForProductCards,
   collectProductUrls,
   extractProductDetail,
+  parseProductText,
+  shouldAbortDetailResource,
+  configureDetailResourcePolicy,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
   debugCards,
@@ -1625,6 +1672,8 @@ module.exports = {
   attachPageDiagnostics,
   DEFAULT_MIN_TEXT_LENGTH,
   DEFAULT_DETAIL_CONCURRENCY,
+  DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS,
+  DEFAULT_DETAIL_READY_TIMEOUT_MS,
   MIN_PRODUCT_COUNT,
   DEFAULT_STALE_LOCK_MS,
   DEFAULT_PAGE_LOAD_TIMEOUT_MS,
