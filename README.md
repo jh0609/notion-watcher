@@ -44,22 +44,28 @@ NTFY_SERVER_URL=https://ntfy.sh
 NTFY_TOPIC=notion-watch-3d9f2c8a7b1e4f6d9a2c
 NTFY_TOKEN=tk_xxxxxxxxxxxxxxxxx
 STATE_FILE=./notion-watcher-state.json
+OPERATION_STATE_FILE=./notion-watcher-operation-state.json
 LOCK_FILE=./notion-watcher.lock
 MAX_TEXT_CHANGE_RATIO=0.7
-PAGE_TIMEOUT_MS=60000
+PAGE_LOAD_TIMEOUT_MS=60000
+PAGE_FETCH_MAX_ATTEMPTS=3
+PAGE_FETCH_RETRY_DELAYS_MS=10000,30000
 DOMCONTENTLOADED_TIMEOUT_MS=15000
 RENDER_WAIT_MS=8000
 COLLECTION_WAIT_MS=10000
 EXTRA_WAIT_MS=1500
+OPERATOR_NTFY_TOPIC=
 ```
 
-`NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
+`NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `OPERATION_STATE_FILE` 기본값은 `./notion-watcher-operation-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
 `MAX_TEXT_CHANGE_RATIO`는 이전 본문과 현재 본문의 길이 차이가 너무 클 때 추출 실패로 보고 상태를 갱신하지 않는 보호장치입니다. 기본값 `0.7`은 길이 변화가 70%를 넘으면 오류로 처리합니다.
 
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 
-- `PAGE_TIMEOUT_MS`: 페이지 첫 응답 대기 시간, 기본 `60000`
+- `PAGE_LOAD_TIMEOUT_MS`: 각 페이지 조회 시도의 첫 응답 대기 시간, 기본 `60000`
+- `PAGE_FETCH_MAX_ATTEMPTS`: 같은 실행 안에서 페이지 조회를 시도할 최대 횟수, 기본 `3`
+- `PAGE_FETCH_RETRY_DELAYS_MS`: 재시도 전 대기 시간 목록, 기본 `10000,30000`
 - `DOMCONTENTLOADED_TIMEOUT_MS`: `domcontentloaded` 이벤트 추가 대기 시간, 기본 `15000`
 - `RENDER_WAIT_MS`: Notion 본문 DOM 대기 시간, 기본 `8000`
 - `COLLECTION_WAIT_MS`: 상품 카드 `.notion-collection-item` 대기 시간, 기본 `10000`
@@ -68,6 +74,8 @@ EXTRA_WAIT_MS=1500
 상품 표가 늦게 렌더링되는 서버라면 예를 들어 `COLLECTION_WAIT_MS=30000`, `EXTRA_WAIT_MS=3000`처럼 늘릴 수 있습니다.
 
 공개 Notion 페이지가 아니거나 로그인이 필요한 페이지라면 정상 본문으로 처리되지 않을 수 있습니다.
+
+페이지 조회 실패는 같은 실행 안에서 새 Playwright browser/context/page로 최대 3회 재시도합니다. 모든 시도가 실패하면 일반 상태 파일은 변경하지 않고 공개 공지 토픽에도 알림을 보내지 않습니다. 대신 `OPERATION_STATE_FILE`에 연속 페이지 조회 실패 횟수를 저장합니다. `OPERATOR_NTFY_TOPIC`을 설정하면 두 번의 cron 실행이 연속 실패했을 때 운영자 전용 토픽으로 장애 알림을 보내고, 이후 정상 조회에 성공하면 복구 알림을 한 번 보냅니다.
 
 ## ntfy 설정
 

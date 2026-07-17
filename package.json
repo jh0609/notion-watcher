@@ -6,7 +6,8 @@
   "main": "notion-watcher-once.js",
   "scripts": {
     "start": "node notion-watcher-once.js",
-    "check": "node --check notion-watcher-once.js"
+    "check": "node --check notion-watcher-once.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

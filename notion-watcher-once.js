@@ -8,14 +8,18 @@ const path = require('path');
 
 const DEFAULT_STATE_FILE = './notion-watcher-state.json';
 const DEFAULT_LOCK_FILE = './notion-watcher.lock';
+const DEFAULT_OPERATION_STATE_FILE = './notion-watcher-operation-state.json';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
 const DEFAULT_MAX_TEXT_CHANGE_RATIO = 0.7;
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
-const DEFAULT_PAGE_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS = 15 * 1000;
 const DEFAULT_RENDER_WAIT_MS = 8 * 1000;
 const DEFAULT_COLLECTION_WAIT_MS = 10 * 1000;
 const DEFAULT_EXTRA_WAIT_MS = 1500;
+const DEFAULT_PAGE_FETCH_MAX_ATTEMPTS = 3;
+const DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000];
+const OPERATOR_ALERT_FAILURE_THRESHOLD = 2;
 
 const FALLBACK_CHROME_VERSION = '149.0.0.0';
 
@@ -51,6 +55,18 @@ const ERROR_PAGE_PATTERNS = [
   /notion is unavailable/i
 ];
 
+const NETWORK_ERROR_PATTERNS = [
+  /net::/i,
+  /network/i,
+  /dns/i,
+  /socket/i,
+  /econnreset/i,
+  /econnrefused/i,
+  /etimedout/i,
+  /enotfound/i,
+  /err_/i
+];
+
 function log(level, message) {
   console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
 }
@@ -69,7 +85,11 @@ function resolveConfig(env = process.env) {
   const minTextLength = Number.parseInt(env.MIN_TEXT_LENGTH || `${DEFAULT_MIN_TEXT_LENGTH}`, 10);
   const maxTextChangeRatio = Number.parseFloat(env.MAX_TEXT_CHANGE_RATIO || `${DEFAULT_MAX_TEXT_CHANGE_RATIO}`);
   const staleLockMs = Number.parseInt(env.STALE_LOCK_MS || `${DEFAULT_STALE_LOCK_MS}`, 10);
-  const pageTimeoutMs = parsePositiveIntegerEnv(env, 'PAGE_TIMEOUT_MS', DEFAULT_PAGE_TIMEOUT_MS);
+  const pageLoadTimeoutMs = parsePositiveIntegerEnv(
+    { PAGE_LOAD_TIMEOUT_MS: env.PAGE_LOAD_TIMEOUT_MS || env.PAGE_TIMEOUT_MS },
+    'PAGE_LOAD_TIMEOUT_MS',
+    DEFAULT_PAGE_LOAD_TIMEOUT_MS
+  );
   const domcontentloadedTimeoutMs = parsePositiveIntegerEnv(
     env,
     'DOMCONTENTLOADED_TIMEOUT_MS',
@@ -78,6 +98,15 @@ function resolveConfig(env = process.env) {
   const renderWaitMs = parsePositiveIntegerEnv(env, 'RENDER_WAIT_MS', DEFAULT_RENDER_WAIT_MS);
   const collectionWaitMs = parsePositiveIntegerEnv(env, 'COLLECTION_WAIT_MS', DEFAULT_COLLECTION_WAIT_MS);
   const extraWaitMs = parsePositiveIntegerEnv(env, 'EXTRA_WAIT_MS', DEFAULT_EXTRA_WAIT_MS);
+  const pageFetchMaxAttempts = parsePositiveIntegerEnv(
+    env,
+    'PAGE_FETCH_MAX_ATTEMPTS',
+    DEFAULT_PAGE_FETCH_MAX_ATTEMPTS
+  );
+  const pageFetchRetryDelaysMs = parseRetryDelaysEnv(
+    env.PAGE_FETCH_RETRY_DELAYS_MS,
+    DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS
+  );
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -94,16 +123,21 @@ function resolveConfig(env = process.env) {
     ntfyServerUrl: env.NTFY_SERVER_URL.replace(/\/+$/, ''),
     ntfyTopic: env.NTFY_TOPIC,
     ntfyToken: env.NTFY_TOKEN,
+    operatorNtfyTopic: env.OPERATOR_NTFY_TOPIC || '',
     stateFile: env.STATE_FILE || DEFAULT_STATE_FILE,
+    operationStateFile: env.OPERATION_STATE_FILE || DEFAULT_OPERATION_STATE_FILE,
     lockFile: env.LOCK_FILE || DEFAULT_LOCK_FILE,
     minTextLength,
     maxTextChangeRatio,
     staleLockMs,
-    pageTimeoutMs,
+    pageLoadTimeoutMs,
+    pageTimeoutMs: pageLoadTimeoutMs,
     domcontentloadedTimeoutMs,
     renderWaitMs,
     collectionWaitMs,
-    extraWaitMs
+    extraWaitMs,
+    pageFetchMaxAttempts,
+    pageFetchRetryDelaysMs
   };
 }
 
@@ -113,6 +147,15 @@ function parsePositiveIntegerEnv(env, name, defaultValue) {
     throw new Error(`${name}는 1 이상의 숫자여야 합니다.`);
   }
   return value;
+}
+
+function parseRetryDelaysEnv(value, defaultValue) {
+  if (!value) return [...defaultValue];
+  const delays = value.split(',').map((part) => Number.parseInt(part.trim(), 10));
+  if (delays.some((delay) => !Number.isFinite(delay) || delay < 0)) {
+    throw new Error('PAGE_FETCH_RETRY_DELAYS_MS는 0 이상의 숫자를 쉼표로 구분해야 합니다.');
+  }
+  return delays;
 }
 
 async function pathExists(filePath) {
@@ -214,7 +257,7 @@ async function fetchNotionPageText(notionPageUrl, config = {}) {
 
 async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
   let browser;
-  const pageTimeoutMs = config.pageTimeoutMs || DEFAULT_PAGE_TIMEOUT_MS;
+  const pageLoadTimeoutMs = config.pageLoadTimeoutMs || config.pageTimeoutMs || DEFAULT_PAGE_LOAD_TIMEOUT_MS;
   const domcontentloadedTimeoutMs = config.domcontentloadedTimeoutMs || DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS;
   const renderWaitMs = config.renderWaitMs || DEFAULT_RENDER_WAIT_MS;
   const collectionWaitMs = config.collectionWaitMs || DEFAULT_COLLECTION_WAIT_MS;
@@ -234,12 +277,12 @@ async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
       }
     });
     const page = await context.newPage();
-    page.setDefaultTimeout(pageTimeoutMs);
+    page.setDefaultTimeout(pageLoadTimeoutMs);
 
     log('INFO', '페이지 접속을 시작합니다.');
     await page.goto(notionPageUrl, {
       waitUntil: 'commit',
-      timeout: pageTimeoutMs
+      timeout: pageLoadTimeoutMs
     });
 
     await page.waitForLoadState('domcontentloaded', {
@@ -263,10 +306,16 @@ async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
 
     const snapshot = await extractPageSnapshot(page);
     const title = await page.title().catch(() => '');
-    assertNotionContentLooksUsable(`${title}\n${snapshot.text}`);
-    return snapshot;
+    const url = page.url();
+    assertNotionContentLooksUsable({
+      url,
+      title,
+      text: snapshot.text,
+      renderedCandidateCount: snapshot.renderedCandidateCount
+    });
+    return { ...snapshot, title, url };
   } catch (error) {
-    throw new Error(`페이지 조회에 실패했습니다: ${error.message}`);
+    throw createPageFetchError(error);
   } finally {
     if (browser) {
       await browser.close().catch(() => undefined);
@@ -359,7 +408,8 @@ async function extractPageSnapshot(page) {
     return {
       text,
       updateText: updateText || '',
-      tableText
+      tableText,
+      renderedCandidateCount: scored.length + collectionItems.length
     };
   });
 }
@@ -369,10 +419,56 @@ async function extractVisiblePageText(page) {
   return snapshot.text;
 }
 
-function assertNotionContentLooksUsable(text) {
-  if (ERROR_PAGE_PATTERNS.some((pattern) => pattern.test(text))) {
-    throw new Error('Notion 로그인 페이지 또는 오류 페이지로 판단되어 본문으로 처리하지 않습니다.');
+function assertNotionContentLooksUsable(snapshot) {
+  const reason = getUnusablePageReason(snapshot);
+  if (reason) {
+    throw new PageFetchError(reason, 'login or error page suspected');
   }
+}
+
+function getUnusablePageReason(snapshot = {}) {
+  const url = `${snapshot.url || ''}`.toLowerCase();
+  const title = `${snapshot.title || ''}`.trim();
+  const text = `${snapshot.text || ''}`;
+  const combined = `${title}\n${text}`;
+  const textLength = text.trim().length;
+  const hasExplicitErrorPhrase = ERROR_PAGE_PATTERNS.some((pattern) => pattern.test(combined));
+  const urlLooksLikeAuth = /\/(login|signup|sign-in|sign-up)(?:[/?#]|$)/i.test(url);
+  const titleLooksLikeAuthOrError = /\b(log in|sign in|sign up|login|error|not found)\b/i.test(title);
+  const titleLooksGeneric = /^notion$/i.test(title) || title.length === 0;
+  const bodyLooksTooSmallForAuthPage = textLength < Math.max(DEFAULT_MIN_TEXT_LENGTH, 120);
+  const renderedCandidateCount = Number.parseInt(snapshot.renderedCandidateCount || 0, 10);
+
+  if (hasExplicitErrorPhrase) return 'login or error page suspected';
+  if (urlLooksLikeAuth && (titleLooksLikeAuthOrError || bodyLooksTooSmallForAuthPage)) {
+    return 'login or error page suspected';
+  }
+  if (titleLooksLikeAuthOrError && titleLooksGeneric && bodyLooksTooSmallForAuthPage) {
+    return 'login or error page suspected';
+  }
+  if (renderedCandidateCount === 0 && textLength === 0) return 'body not rendered';
+  return '';
+}
+
+class PageFetchError extends Error {
+  constructor(reason, detail = '') {
+    super(detail ? `${reason}: ${detail}` : reason);
+    this.name = 'PageFetchError';
+    this.reason = reason;
+    this.retryable = true;
+  }
+}
+
+function createPageFetchError(error) {
+  if (error instanceof PageFetchError) return error;
+  const message = error && error.message ? error.message : `${error}`;
+  if (/timeout/i.test(message)) {
+    return new PageFetchError('navigation timeout');
+  }
+  if (NETWORK_ERROR_PATTERNS.some((pattern) => pattern.test(message))) {
+    return new PageFetchError('network error');
+  }
+  return new PageFetchError('page fetch failed', message);
 }
 
 function normalizeText(text) {
@@ -530,8 +626,163 @@ async function sendNtfyNotification(config, checkedAt, previousTextLength, curre
   }
 }
 
+async function sendOperatorNotification(config, title, body) {
+  if (!config.operatorNtfyTopic) return false;
+  const url = `${config.ntfyServerUrl}/${encodeURIComponent(config.operatorNtfyTopic)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Title: encodeHeaderValue(title),
+      Authorization: `Bearer ${config.ntfyToken}`,
+      Priority: 'high',
+      Tags: 'warning',
+      'Content-Type': 'text/plain; charset=utf-8'
+    },
+    body
+  });
+
+  if (!response.ok) {
+    throw new Error(`operator ntfy 응답 상태 ${response.status}`);
+  }
+  return true;
+}
+
 function encodeHeaderValue(value) {
   return `=?UTF-8?B?${Buffer.from(value, 'utf8').toString('base64')}?=`;
+}
+
+async function fetchPageSnapshotWithRetries(deps, config, previousState) {
+  const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
+  let lastReason = 'page fetch failed';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const snapshot = deps.fetchPageSnapshot
+        ? await deps.fetchPageSnapshot(config.notionPageUrl, config)
+        : { text: await deps.fetchPageText(config.notionPageUrl, config), tableText: '', updateText: '' };
+      validateFetchedSnapshot(snapshot, config, previousState);
+      log('INFO', `페이지 조회 ${attempt}/${maxAttempts} 성공`);
+      return { ok: true, snapshot };
+    } catch (error) {
+      const pageFetchError = createPageFetchError(error);
+      lastReason = pageFetchError.reason;
+      log('WARN', `페이지 조회 ${attempt}/${maxAttempts} 실패: ${lastReason}`);
+      if (attempt >= maxAttempts) break;
+
+      const delayMs = getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt);
+      if (delayMs > 0) {
+        log('INFO', `${Math.round(delayMs / 1000)}초 후 다시 시도합니다.`);
+        await deps.sleep(delayMs);
+      }
+    }
+  }
+
+  return { ok: false, reason: lastReason };
+}
+
+function validateFetchedSnapshot(snapshot, config, previousState) {
+  const unusableReason = getUnusablePageReason(snapshot);
+  if (unusableReason) throw new PageFetchError(unusableReason);
+
+  const normalizedText = normalizeText(snapshot.text || '');
+  if (normalizedText.length < config.minTextLength) {
+    throw new PageFetchError('body below minimum length');
+  }
+
+  if (previousState && isSuspiciousTextSizeChange(previousState.text || '', normalizedText, config.maxTextChangeRatio)) {
+    throw new PageFetchError('body length changed suspiciously');
+  }
+}
+
+function getRetryDelayMs(delays, failedAttemptNumber) {
+  if (!Array.isArray(delays) || delays.length === 0) return 0;
+  return delays[Math.min(failedAttemptNumber - 1, delays.length - 1)] || 0;
+}
+
+async function readOperationState(operationStateFile) {
+  const defaultState = {
+    consecutivePageFetchFailures: 0,
+    pageFetchAlertSent: false,
+    lastFailureReason: '',
+    updatedAt: null
+  };
+  try {
+    const raw = await fs.readFile(path.resolve(operationStateFile), 'utf8');
+    return { ...defaultState, ...JSON.parse(raw) };
+  } catch (error) {
+    if (error.code === 'ENOENT') return defaultState;
+    throw new Error(`운영 상태 파일 읽기에 실패했습니다: ${error.message}`);
+  }
+}
+
+async function saveOperationState(operationStateFile, state) {
+  await saveStateAtomic(operationStateFile, state);
+}
+
+async function recordPageFetchFailure(config, deps, reason) {
+  const operationState = await readOperationState(config.operationStateFile);
+  const nextState = {
+    ...operationState,
+    consecutivePageFetchFailures: (operationState.consecutivePageFetchFailures || 0) + 1,
+    lastFailureReason: reason,
+    updatedAt: deps.now().toISOString()
+  };
+
+  if (
+    nextState.consecutivePageFetchFailures >= OPERATOR_ALERT_FAILURE_THRESHOLD &&
+    !operationState.pageFetchAlertSent &&
+    config.operatorNtfyTopic
+  ) {
+    try {
+      await deps.sendOperatorNotification(
+        config,
+        'Notion watcher 페이지 조회 실패',
+        [
+          'Notion watcher 페이지 조회가 두 번의 cron 실행에서 연속 실패했습니다.',
+          `연속 실패 횟수: ${nextState.consecutivePageFetchFailures}`,
+          `마지막 실패 이유: ${reason}`
+        ].join('\n')
+      );
+      nextState.pageFetchAlertSent = true;
+      log('INFO', '운영자 장애 알림을 전송했습니다.');
+    } catch (error) {
+      log('ERROR', `운영자 장애 알림 전송에 실패했습니다: ${error.message}`);
+    }
+  }
+
+  await saveOperationState(config.operationStateFile, nextState);
+}
+
+async function recordPageFetchSuccess(config, deps) {
+  const operationState = await readOperationState(config.operationStateFile);
+  if ((operationState.consecutivePageFetchFailures || 0) === 0 && !operationState.pageFetchAlertSent) return;
+
+  const nextState = {
+    ...operationState,
+    consecutivePageFetchFailures: 0,
+    lastFailureReason: '',
+    updatedAt: deps.now().toISOString()
+  };
+
+  if (operationState.pageFetchAlertSent && config.operatorNtfyTopic) {
+    try {
+      await deps.sendOperatorNotification(
+        config,
+        'Notion watcher 페이지 조회 복구',
+        'Notion watcher 페이지 조회가 정상으로 복구되었습니다.'
+      );
+      log('INFO', '운영자 복구 알림을 전송했습니다.');
+    } catch (error) {
+      log('ERROR', `운영자 복구 알림 전송에 실패했습니다: ${error.message}`);
+    }
+  }
+
+  nextState.pageFetchAlertSent = false;
+  await saveOperationState(config.operationStateFile, nextState);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runOnce(options = {}) {
@@ -539,6 +790,8 @@ async function runOnce(options = {}) {
     fetchPageSnapshot: fetchNotionPageSnapshot,
     fetchPageText: fetchNotionPageText,
     sendNotification: sendNtfyNotification,
+    sendOperatorNotification,
+    sleep,
     now: () => new Date(),
     ...options.deps
   };
@@ -560,31 +813,6 @@ async function runOnce(options = {}) {
     }
     log('INFO', '잠금을 획득했습니다.');
 
-    let snapshot;
-    try {
-      if (deps.fetchPageSnapshot) {
-        snapshot = await deps.fetchPageSnapshot(config.notionPageUrl, config);
-      } else {
-        snapshot = { text: await deps.fetchPageText(config.notionPageUrl, config), tableText: '' };
-      }
-    } catch (error) {
-      log('ERROR', '페이지 접근 실패');
-      throw error;
-    }
-
-    const normalizedText = normalizeText(snapshot.text);
-    const normalizedTableText = normalizeText(snapshot.tableText || '');
-    const normalizedUpdateText = normalizeText(snapshot.updateText || '');
-    if (normalizedText.length < config.minTextLength) {
-      log('ERROR', '추출된 페이지 본문이 너무 짧아 정상적인 페이지로 판단할 수 없습니다.');
-      throw new Error('추출된 페이지 본문이 너무 짧아 정상적인 페이지로 판단할 수 없습니다.');
-    }
-
-    log('INFO', '본문 추출에 성공했습니다.');
-    const hash = createHash(normalizedText);
-    const { changeKey, changeKeyType } = getChangeKey(hash, normalizedUpdateText);
-    const checkedAt = deps.now().toISOString();
-
     let previousState;
     try {
       previousState = await readState(config.stateFile);
@@ -592,6 +820,24 @@ async function runOnce(options = {}) {
       log('ERROR', '상태 파일 읽기에 실패했습니다.');
       throw error;
     }
+
+    const fetchResult = await fetchPageSnapshotWithRetries(deps, config, previousState);
+    if (!fetchResult.ok) {
+      await recordPageFetchFailure(config, deps, fetchResult.reason);
+      throw new PageFetchError(fetchResult.reason || 'page fetch failed');
+    }
+
+    await recordPageFetchSuccess(config, deps);
+
+    const snapshot = fetchResult.snapshot;
+    const normalizedText = normalizeText(snapshot.text);
+    const normalizedTableText = normalizeText(snapshot.tableText || '');
+    const normalizedUpdateText = normalizeText(snapshot.updateText || '');
+
+    log('INFO', '본문 추출에 성공했습니다.');
+    const hash = createHash(normalizedText);
+    const { changeKey, changeKeyType } = getChangeKey(hash, normalizedUpdateText);
+    const checkedAt = deps.now().toISOString();
 
     if (!previousState) {
       await saveStateWithLog(config.stateFile, {
@@ -606,11 +852,6 @@ async function runOnce(options = {}) {
       });
       log('INFO', '최초 상태를 저장했습니다.');
       return 0;
-    }
-
-    if (isSuspiciousTextSizeChange(previousState.text || '', normalizedText, config.maxTextChangeRatio)) {
-      log('ERROR', '추출된 페이지 본문 길이 변화가 비정상적으로 커서 정상적인 페이지로 판단할 수 없습니다.');
-      throw new Error('추출된 페이지 본문 길이 변화가 비정상적으로 커서 정상적인 페이지로 판단할 수 없습니다.');
     }
 
     const previousChangeKey = getPreviousChangeKey(previousState);
@@ -659,7 +900,7 @@ async function runOnce(options = {}) {
       log('ERROR', error.message);
     } else if (/필수 환경변수|MIN_TEXT_LENGTH|MAX_TEXT_CHANGE_RATIO|STALE_LOCK_MS|TIMEOUT_MS|WAIT_MS/.test(error.message)) {
       log('ERROR', error.message);
-    } else if (/페이지 조회|본문/.test(error.message)) {
+    } else if (error instanceof PageFetchError || /페이지 조회|본문|navigation timeout|network error|body/.test(error.message)) {
       log('ERROR', error.message);
     } else {
       log('ERROR', `예상하지 못한 오류: ${error.message}`);
@@ -713,9 +954,12 @@ module.exports = {
   DEFAULT_MIN_TEXT_LENGTH,
   DEFAULT_MAX_TEXT_CHANGE_RATIO,
   DEFAULT_STALE_LOCK_MS,
-  DEFAULT_PAGE_TIMEOUT_MS,
+  DEFAULT_PAGE_LOAD_TIMEOUT_MS,
+  DEFAULT_PAGE_TIMEOUT_MS: DEFAULT_PAGE_LOAD_TIMEOUT_MS,
   DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS,
   DEFAULT_RENDER_WAIT_MS,
   DEFAULT_COLLECTION_WAIT_MS,
-  DEFAULT_EXTRA_WAIT_MS
+  DEFAULT_EXTRA_WAIT_MS,
+  DEFAULT_PAGE_FETCH_MAX_ATTEMPTS,
+  DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS
 };
