@@ -2730,9 +2730,23 @@ async function runOnce(options = {}) {
       return 0;
     }
 
-    log('INFO', '상품 변경을 감지했습니다.');
     const diff = diffCatalog(previousState.catalog || { products: [] }, catalog);
     if (hybridState.hybridSummary) log('INFO', `실행 요약: ${JSON.stringify({ ...hybridState.hybridSummary, changedProducts: diff.length })}`);
+
+    if (diff.length === 0) {
+      await saveStateWithLog(config.stateFile, {
+        ...previousState,
+        hash,
+        catalog,
+        ...hybridState,
+        checkedAt,
+        changedAt: previousState.changedAt || null
+      });
+      log('INFO', '저장 메타데이터만 변경되어 공개 알림을 건너뜁니다.');
+      return 0;
+    }
+
+    log('INFO', '상품 변경을 감지했습니다.');
     const diffText = formatCatalogDiff(diff);
     try {
       await deps.sendNotification(config, checkedAt, previousState.catalog?.products?.length || 0, catalog.products.length, diffText);
