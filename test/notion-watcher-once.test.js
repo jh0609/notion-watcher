@@ -6,7 +6,8 @@ const os = require('os');
 const path = require('path');
 const test = require('node:test');
 const {
-  normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate, runOnce
+  normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
+  canonicalizeNotionProductUrl, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -75,6 +76,19 @@ test('X 링크는 상품 URL 후보에서 명시적으로 제거한다', () => {
   assert.equal(result.allowed, false);
   assert.equal(result.hostname, 'x.com');
   assert.equal(result.reason, 'blocked external host');
+});
+
+test('peek, modal, block-id URL을 같은 Notion 상품 URL로 정규화한다', () => {
+  const main = 'https://shop.notion.site/MD-3973f4a9f62680f39ddafca527725466';
+  const id = '5273f4a9f62683e5b87581c092c3aff2';
+  const variants = [
+    `https://shop.notion.site/${id}`,
+    `${main}?p=${id}&pm=c`,
+    `https://shop.notion.site/product-name-${id}?pvs=23`
+  ];
+  assert.deepEqual([...new Set(variants.map((url) => canonicalizeNotionProductUrl(url, main)))], [
+    `https://shop.notion.site/${id}`
+  ]);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {

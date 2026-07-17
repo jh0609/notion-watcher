@@ -3,6 +3,7 @@ node_modules/
 notion-watcher-state.json
 notion-watcher-state.json.tmp
 notion-watcher.lock
+debug/
 *.log
 
 # Optional custom runtime files. Keep actual values in .env local to the server.

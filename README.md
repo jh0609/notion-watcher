@@ -15,6 +15,8 @@
 
 URL 후보는 메인 페이지와 같은 호스트 또는 `notion.so`/`notion.site` 내부 페이지만 허용합니다. X, Twitter, Instagram, YouTube, Facebook과 기타 외부 호스트, `mailto:`, `tel:`, `javascript:`, 해시 링크 및 메인 페이지 자체는 제외합니다. 각 후보의 링크 문구, 호스트, 판정과 제외 사유는 `DEBUG product-url-candidate` JSON 로그로 출력됩니다. 갤러리 카드에 `href`가 없으면 `role=link`, `data-page-id`, `data-block-id` 카드 구조와 클릭 후 이동 URL을 확인합니다.
 
+카드 후보는 갤러리/데이터베이스 구조, 가격·판매 상태 문구, 클릭 가능한 스타일이나 역할, Notion ID 속성, 이미지와 텍스트 조합을 점수화해 선정합니다. 각 후보를 실제로 클릭한 뒤 현재 URL과 history 변경, popup, peek/modal, modal 내부 링크 및 `Open as page`/`전체 페이지로 열기` 동작을 조사합니다. 후보별 실패는 다음 후보 조사를 막지 않으며 `card-click-result` DEBUG JSON 로그에 남습니다.
+
 상품이 2개 미만이거나 외부 서비스 제목이 감지되거나 상세 페이지 하나라도 실패하면 최초 실행을 포함해 카탈로그 상태를 저장하지 않습니다.
 
 ## 설치
@@ -52,6 +54,8 @@ OPERATION_STATE_FILE=./notion-watcher-operation-state.json
 LOCK_FILE=./notion-watcher.lock
 SNAPSHOT_DIR=./snapshots
 DETAIL_CONCURRENCY=2
+DEBUG_DOM=false
+DEBUG_DIR=./debug
 PAGE_LOAD_TIMEOUT_MS=60000
 PAGE_FETCH_MAX_ATTEMPTS=3
 PAGE_FETCH_RETRY_DELAYS_MS=10000,30000
@@ -65,6 +69,21 @@ OPERATOR_NTFY_TOPIC=
 `NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `OPERATION_STATE_FILE` 기본값은 `./notion-watcher-operation-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
 `SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 기본값은 `2`입니다.
+
+`DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
+
+- `main-page.html`, `main-page.png`
+- `card-candidates.json`
+- `card-click-results.json`
+- modal/peek이 열린 카드의 `modal-N.html`, `modal-N.png`
+
+ntfy 설정 없이 실제 Notion 카드만 수동 진단하려면 `NOTION_PAGE_URL`을 설정한 뒤 실행합니다.
+
+```bash
+npm run debug:cards
+```
+
+수동 진단 모드는 항상 DOM 진단 파일을 저장하며 카탈로그 상태나 알림 상태는 변경하지 않습니다.
 
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 
