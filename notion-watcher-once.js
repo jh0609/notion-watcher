@@ -15,10 +15,13 @@ const DEFAULT_SNAPSHOT_DIR = './snapshots';
 const DEFAULT_DETAIL_CONCURRENCY = 1;
 const DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_DETAIL_READY_TIMEOUT_MS = 10 * 1000;
+const DEFAULT_DETAIL_READY_POLL_INTERVAL_MS = 250;
 const DEFAULT_DETAIL_HARD_TIMEOUT_MS = 35 * 1000;
 const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 10 * 1000;
 const DEFAULT_DETAIL_HYDRATION_BACKOFF_MS = 50 * 1000;
 const DEFAULT_DETAIL_HYDRATION_MAX_RETRIES = 1;
+const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_DETAIL_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
@@ -130,12 +133,15 @@ function resolveConfig(env = process.env) {
     env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS
   );
   const detailReadyTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS);
+  const detailReadyPollIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_POLL_INTERVAL_MS', DEFAULT_DETAIL_READY_POLL_INTERVAL_MS);
   const detailHardTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS);
   const mainToDetailDelayMs = parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
   const detailBlockHeavyResources = parseBooleanEnv(env.DETAIL_BLOCK_HEAVY_RESOURCES, true);
   const detailServiceWorkers = parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS);
   const detailHydrationBackoffMs = parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS);
   const detailHydrationMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES);
+  const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
+  const detailRecheckIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_RECHECK_INTERVAL_MS', DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -162,6 +168,7 @@ function resolveConfig(env = process.env) {
     detailConcurrency,
     detailNavigationTimeoutMs,
     detailReadyTimeoutMs,
+    detailReadyPollIntervalMs,
     detailHardTimeoutMs,
     detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
     mainToDetailDelayMs,
@@ -169,6 +176,8 @@ function resolveConfig(env = process.env) {
     detailServiceWorkers,
     detailHydrationBackoffMs,
     detailHydrationMaxRetries,
+    detailFullScanIntervalMs,
+    detailRecheckIntervalMs,
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -203,6 +212,7 @@ function resolveDetailBenchmarkConfig(env = process.env) {
     url: env.DETAIL_BENCHMARK_URL,
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailReadyPollIntervalMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_POLL_INTERVAL_MS', DEFAULT_DETAIL_READY_POLL_INTERVAL_MS),
     detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS)
   };
 }
@@ -214,6 +224,7 @@ function resolveSingleDetailConfig(env = process.env) {
     url,
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailReadyPollIntervalMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_POLL_INTERVAL_MS', DEFAULT_DETAIL_READY_POLL_INTERVAL_MS),
     detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS),
     detailBlockHeavyResources: parseBooleanEnv(env.DETAIL_BLOCK_HEAVY_RESOURCES, true),
     detailServiceWorkers: parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS)
@@ -230,6 +241,7 @@ function resolveTransitionDiagnosticConfig(env = process.env) {
     pageFetchRetryDelaysMs: parseRetryDelaysEnv(env.PAGE_FETCH_RETRY_DELAYS_MS, DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS),
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailReadyPollIntervalMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_POLL_INTERVAL_MS', DEFAULT_DETAIL_READY_POLL_INTERVAL_MS),
     detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS),
     detailConcurrency: parsePositiveIntegerEnv(env, 'DETAIL_CONCURRENCY', DEFAULT_DETAIL_CONCURRENCY),
     detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
@@ -1092,6 +1104,63 @@ function normalizeCatalog(products) {
   };
 }
 
+function parseProductCard(candidate, mainUrl) {
+  const resolved = resolveCardProductUrl(candidate, mainUrl);
+  if (!resolved?.url) return null;
+  const url = canonicalizeNotionProductUrl(resolved.url, mainUrl);
+  const rawText = normalizeValue(candidate.innerText);
+  const firstFieldIndex = rawText.search(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d|판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE/i);
+  const cardTitle = normalizeValue(firstFieldIndex > 0 ? rawText.slice(0, firstFieldIndex) : '');
+  const parsed = parseProductText(cardTitle, rawText, []);
+  const overallStatus = rawText.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i);
+  const variantText = overallStatus ? rawText.slice((overallStatus.index || 0) + overallStatus[0].length) : rawText;
+  const visibleVariants = normalizeProduct({ characters: parseProductText('', variantText, []).characters }).characters;
+  const visibleVariantCount = visibleVariants.length;
+  const explicitTotal = [
+    ...rawText.matchAll(/(?:총|전체)\s*(\d+)\s*(?:개|종)/gi),
+    ...rawText.matchAll(/(\d+)\s*(?:개|종)\s*(?:옵션|캐릭터|디자인)/gi)
+  ].map((match) => Number.parseInt(match[1], 10)).filter(Number.isFinite);
+  const hiddenCount = Number.parseInt(rawText.match(/(?:외|\+)\s*(\d+)\s*(?:개|종)?/i)?.[1] || '0', 10);
+  const totalVariantCount = Math.max(visibleVariantCount, ...explicitTotal, visibleVariantCount + hiddenCount);
+  const cardIncomplete = !parsed.name || !parsed.price || !parsed.status;
+  const requiresDetail = visibleVariantCount >= 6 || totalVariantCount > visibleVariantCount ||
+    /일부\s*(?:상품\s*)?품절|일시\s*품절/i.test(rawText) || cardIncomplete;
+  const stableCard = {
+    url, name: parsed.name, price: parsed.price, status: parsed.status,
+    characters: visibleVariants, visibleVariantCount, totalVariantCount, cardIncomplete
+  };
+  return { ...stableCard, cardHash: createHash(JSON.stringify(stableCard)), requiresDetail, rawText };
+}
+
+function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
+  const cardsByUrl = new Map();
+  for (const candidate of discovery.candidates || []) {
+    const card = parseProductCard(candidate, config.notionPageUrl);
+    if (card) cardsByUrl.set(card.url, card);
+  }
+  const previousMetadata = previousState?.productMetadata || {};
+  const previousProducts = new Map((previousState?.catalog?.products || []).map((product) => [product.url, product]));
+  const firstFullRun = !previousState || !Object.keys(previousMetadata).length;
+  const lastFullScanAt = Date.parse(previousState?.lastFullDetailScanAt || '');
+  const fullScanDue = firstFullRun || !Number.isFinite(lastFullScanAt) ||
+    now.getTime() - lastFullScanAt >= (config.detailFullScanIntervalMs || DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
+  const cards = discovery.urls.map((url) => cardsByUrl.get(url) || {
+    url, name: '', price: '', status: '', characters: [], visibleVariantCount: 0,
+    totalVariantCount: 0, cardIncomplete: true, requiresDetail: true,
+    cardHash: createHash(JSON.stringify({ url, missing: true }))
+  });
+  const detailUrls = cards.filter((card) => {
+    const previous = previousMetadata[card.url];
+    const lastChecked = Date.parse(previous?.lastDetailCheckedAt || '');
+    const stale = !Number.isFinite(lastChecked) || now.getTime() - lastChecked >=
+      (config.detailRecheckIntervalMs || DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
+    return firstFullRun || fullScanDue || card.cardIncomplete || card.requiresDetail ||
+      Number(previous?.totalVariantCount || 0) > card.visibleVariantCount ||
+      !previous || previous.cardHash !== card.cardHash || stale;
+  }).map((card) => card.url);
+  return { cards, detailUrls, previousMetadata, previousProducts, firstFullRun, fullScanDue };
+}
+
 function serializeCatalog(catalog) {
   return `${JSON.stringify(catalog, null, 2)}\n`;
 }
@@ -1477,9 +1546,31 @@ function createDetailPageSlot(context) {
   };
 }
 
+async function collectDetailSnapshot(page, expectedPageId) {
+  return page.evaluate((pageId) => {
+    const text = document.body?.innerText || '';
+    const compactUrl = location.href.replace(/-/g, '').toLowerCase();
+    return {
+      currentUrl: location.href,
+      documentReadyState: document.readyState,
+      bodyTextLength: text.trim().length,
+      bodyTextPreview: text.slice(0, 1000),
+      priceMatched: /\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text),
+      statusMatched: /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text),
+      expectedPageId: pageId,
+      expectedPageIdMatched: !pageId || compactUrl.includes(pageId)
+    };
+  }, expectedPageId);
+}
+
+function isUsableDetailSnapshot(snapshot = {}) {
+  return snapshot.expectedPageIdMatched === true && Number(snapshot.bodyTextLength) >= 20;
+}
+
 async function processDetailPage(page, url, config, logPrefix) {
   const navigationTimeoutMs = config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS;
   const readyTimeoutMs = config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS;
+  const readyPollIntervalMs = config.detailReadyPollIntervalMs || DEFAULT_DETAIL_READY_POLL_INTERVAL_MS;
   const hardTimeoutMs = config.detailHardTimeoutMs || DEFAULT_DETAIL_HARD_TIMEOUT_MS;
   page.setDefaultNavigationTimeout(navigationTimeoutMs);
   page.setDefaultTimeout(readyTimeoutMs);
@@ -1491,6 +1582,7 @@ async function processDetailPage(page, url, config, logPrefix) {
   let hardTimer;
   const work = async () => {
     if (!attemptState.cancelled) log('INFO', `${logPrefix} goto 시작`);
+    let readyRecoveredAfterTimeout = false;
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
       if (!attemptState.cancelled) log('INFO', `${logPrefix} goto 완료`);
@@ -1501,46 +1593,47 @@ async function processDetailPage(page, url, config, logPrefix) {
     const readyStartedAt = Date.now();
     if (!attemptState.cancelled) log('INFO', `${logPrefix} ready 대기 시작`);
     try {
-      await page.waitForFunction(({ expectedPageId: pageId }) => {
-        const text = document.body?.innerText || '';
-        const compactUrl = location.href.replace(/-/g, '').toLowerCase();
-        return document.readyState !== 'loading' && text.trim().length >= 20 && (!pageId || compactUrl.includes(pageId));
-      }, { expectedPageId }, { timeout: readyTimeoutMs });
+      let diagnostic;
+      while (Date.now() - readyStartedAt < readyTimeoutMs) {
+        diagnostic = await collectDetailSnapshot(page, expectedPageId);
+        if (isUsableDetailSnapshot(diagnostic)) break;
+        await page.waitForTimeout(readyPollIntervalMs);
+      }
+      if (!isUsableDetailSnapshot(diagnostic)) diagnostic = await collectDetailSnapshot(page, expectedPageId);
+      if (!isUsableDetailSnapshot(diagnostic)) {
+        const error = new Error(`ready timeout after ${readyTimeoutMs}ms`);
+        error.name = 'TimeoutError';
+        error.detailReadySnapshot = diagnostic;
+        throw error;
+      }
       if (!attemptState.cancelled) log('INFO', `${logPrefix} ready 완료 (${Date.now() - readyStartedAt}ms)`);
     } catch (error) {
       if (!attemptState.cancelled) {
-        const diagnostic = await page.evaluate((pageId) => {
-          const text = document.body?.innerText || '';
-          const compactUrl = location.href.replace(/-/g, '').toLowerCase();
-          return {
-            currentUrl: location.href,
-            documentReadyState: document.readyState,
-            bodyTextLength: text.length,
-            bodyTextPreview: text.slice(0, 1000),
-            priceMatched: /\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text),
-            statusMatched: /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text),
-            expectedPageId: pageId,
-            expectedPageIdMatched: !pageId || compactUrl.includes(pageId)
-          };
-        }, expectedPageId).catch(() => ({ diagnosticUnavailable: true }));
-        log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
-        log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
-        pageDiagnostics.flush(30);
-        if (diagnostic.documentReadyState === 'interactive' && diagnostic.bodyTextLength === 0) {
-          if (config.detailAttemptIsLast) {
-            const failedHtmlPath = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR, 'detail-page-failed.html');
-            try {
-              await fs.mkdir(path.dirname(failedHtmlPath), { recursive: true });
-              await fs.writeFile(failedHtmlPath, await page.content(), 'utf8');
-              log('INFO', `마지막 상세 실패 HTML 저장: ${failedHtmlPath}`);
-            } catch (saveError) {
-              log('WARN', `마지막 상세 실패 HTML 저장 실패: ${saveError.message}`);
+        const diagnostic = error.detailReadySnapshot || await collectDetailSnapshot(page, expectedPageId)
+          .catch(() => ({ diagnosticUnavailable: true }));
+        if (isUsableDetailSnapshot(diagnostic)) {
+          log('WARN', `${logPrefix} polling timeout 직후 ready 조건 충족, parse를 계속합니다: ${JSON.stringify(diagnostic)}`);
+          readyRecoveredAfterTimeout = true;
+        } else {
+          log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
+          log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
+          pageDiagnostics.flush(30);
+          if (diagnostic.documentReadyState === 'interactive' && diagnostic.bodyTextLength === 0) {
+            if (config.detailAttemptIsLast) {
+              const failedHtmlPath = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR, 'detail-page-failed.html');
+              try {
+                await fs.mkdir(path.dirname(failedHtmlPath), { recursive: true });
+                await fs.writeFile(failedHtmlPath, await page.content(), 'utf8');
+                log('INFO', `마지막 상세 실패 HTML 저장: ${failedHtmlPath}`);
+              } catch (saveError) {
+                log('WARN', `마지막 상세 실패 HTML 저장 실패: ${saveError.message}`);
+              }
             }
+            throw new PageFetchError('hydration stall', `readyState=interactive, bodyTextLength=0`);
           }
-          throw new PageFetchError('hydration stall', `readyState=interactive, bodyTextLength=0`);
         }
       }
-      throw error;
+      if (!readyRecoveredAfterTimeout) throw error;
     }
     if (!attemptState.cancelled) log('INFO', `${logPrefix} parse 시작`);
     try {
@@ -1686,14 +1779,66 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
 async function fetchProductCatalog(notionPageUrl, config = {}) {
   const { chromium } = require('playwright');
   const mainBrowser = await chromium.launch(getChromiumLaunchOptions());
-  let urls;
+  let discovery;
   try {
-    ({ urls } = await discoverProductUrlsWithRetries(mainBrowser, notionPageUrl, config));
+    discovery = await discoverProductUrlsWithRetries(mainBrowser, notionPageUrl, config);
   } finally {
     await mainBrowser.close();
     log('INFO', '메인 browser 종료 완료');
     logMemoryStage('메인 browser 종료 완료');
   }
+
+  const hybridNow = config.hybridNow instanceof Date ? config.hybridNow : new Date();
+  const hybridPlan = buildHybridDetailPlan(discovery, config.previousState, hybridNow, { ...config, notionPageUrl });
+  const urls = hybridPlan.detailUrls;
+  const buildHybridResult = (detailProducts) => {
+    const detailsByUrl = new Map(detailProducts.filter(Boolean).map((product) => [canonicalizeUrl(product.url, product.url), product]));
+    let reusedDetailCount = 0;
+    let cardOnlyCount = 0;
+    const metadata = {};
+    const combined = hybridPlan.cards.map((card) => {
+      const previous = hybridPlan.previousMetadata[card.url];
+      const previousProduct = hybridPlan.previousProducts.get(card.url);
+      const detail = detailsByUrl.get(card.url);
+      const fullVariants = detail?.characters || previous?.fullVariants || card.characters;
+      if (!detail && previous?.fullVariants) reusedDetailCount += 1;
+      else if (!detail) cardOnlyCount += 1;
+      metadata[card.url] = {
+        id: extractNotionPageId(card.url, card.url) || card.url,
+        cardHash: card.cardHash,
+        name: card.name,
+        price: card.price,
+        status: normalizeStatus(card.status),
+        visibleVariants: card.characters,
+        visibleVariantCount: card.visibleVariantCount,
+        totalVariantCount: detail ? Math.max(card.totalVariantCount, detail.characters.length) : card.totalVariantCount,
+        requiresDetail: card.requiresDetail,
+        lastDetailCheckedAt: detail ? hybridNow.toISOString() : previous?.lastDetailCheckedAt || null,
+        fullVariants: normalizeProduct({ characters: fullVariants }).characters
+      };
+      return {
+        url: card.url,
+        name: detail?.name || card.name || previousProduct?.name || '',
+        price: detail?.price || card.price || previousProduct?.price || '',
+        status: detail?.status || card.status || previousProduct?.status || '',
+        characters: fullVariants
+      };
+    });
+    const catalog = validateCatalog(normalizeCatalog(combined));
+    catalog.productMetadata = metadata;
+    catalog.lastFullDetailScanAt = hybridPlan.fullScanDue ? hybridNow.toISOString() : config.previousState?.lastFullDetailScanAt || null;
+    catalog.hybridSummary = {
+      totalProducts: hybridPlan.cards.length,
+      cardOnlyCount,
+      reusedDetailCount,
+      detailFetchCount: detailProducts.filter(Boolean).length,
+      detailTargetCount: urls.length,
+      detailSuccessCount: detailProducts.filter(Boolean).length,
+      hydrationStallCount: 0
+    };
+    return catalog;
+  };
+  if (!urls.length) return buildHybridResult([]);
 
   await sleep(config.mainToDetailDelayMs || DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
   let detailSession = await createDetailBrowserSession(config);
@@ -1703,7 +1848,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
 
     const products = new Array(urls.length);
     const failures = [];
-    const detailConcurrency = Math.min(config.detailConcurrency || DEFAULT_DETAIL_CONCURRENCY, urls.length);
+    const detailConcurrency = 1;
     const detailStartedAt = Date.now();
     const detailDurationsMs = [];
     const hydrationMaxRetries = config.detailHydrationMaxRetries ?? DEFAULT_DETAIL_HYDRATION_MAX_RETRIES;
@@ -1734,6 +1879,10 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
     let cursor = 1;
     const retryQueue = [];
+    const hydrationResumeQueue = [];
+    let consecutiveHydrationStalls = 0;
+    let hydrationStallCount = 0;
+    let hydrationRecoveryCount = 0;
     const activePages = new Set();
     let downgradedToSerial = false;
     const firstWaveOutcomes = new Map();
@@ -1749,9 +1898,26 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     recordFirstWave(0, false);
     const worker = async (workerIndex) => {
       const workerId = workerIndex + 1;
-      const pageSlot = createDetailPageSlot(detailContext);
+      let pageSlot = createDetailPageSlot(detailContext);
       try {
-        while (retryQueue.length > 0 || cursor < urls.length) {
+        while (retryQueue.length > 0 || cursor < urls.length || hydrationResumeQueue.length > 0) {
+          if (!retryQueue.length && cursor >= urls.length && hydrationResumeQueue.length) {
+            if (hydrationRecoveryCount >= hydrationMaxRetries) {
+              retryQueue.push(...hydrationResumeQueue.splice(0));
+            } else {
+            await pageSlot.discard();
+            await closeDetailBrowserSession(detailSession);
+            const backoffMs = config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS;
+            log('WARN', `남은 hydration stall ${hydrationResumeQueue.length}개 재개를 위해 상세 세션을 재생성합니다.`);
+            await sleep(backoffMs);
+            detailSession = await createDetailBrowserSession(config);
+            detailContext = detailSession.context;
+            pageSlot = createDetailPageSlot(detailContext);
+            retryQueue.push(...hydrationResumeQueue.splice(0));
+            consecutiveHydrationStalls = 0;
+            hydrationRecoveryCount += 1;
+            }
+          }
           const index = retryQueue.length > 0 ? retryQueue.shift() : cursor++;
           const url = urls[index];
           const position = index + 1;
@@ -1760,11 +1926,17 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
           const deadline = productStartedAt + hardTimeoutMs;
           log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url} (workerId=${workerId})`);
           let lastError;
+          let deferredHydration = false;
           const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
           for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             const remainingMs = deadline - Date.now();
-            if (remainingMs <= 0) {
+            const minimumAttemptBudgetMs = Math.min(
+              config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS,
+              5000
+            ) + (config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS) + 2000;
+            if (remainingMs < minimumAttemptBudgetMs) {
               lastError = new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`);
+              log('WARN', `상세 페이지 조회 ${position}/${urls.length} 추가 attempt 생략: 남은 ${remainingMs}ms < 최소 예산 ${minimumAttemptBudgetMs}ms`);
               break;
             }
             const allocated = await pageSlot.get(!reusePages);
@@ -1782,6 +1954,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               recordFirstWave(index, false);
               if (index <= 1 && detailConcurrency === 2) await firstWaveDone;
               lastError = null;
+              consecutiveHydrationStalls = 0;
               const durationMs = Date.now() - productStartedAt;
               detailDurationsMs.push(durationMs);
               log('INFO', `상세 동시성 지표: 활성 page=${activePages.size}, bodyTextLength=${products[index].text.length}, 성공=true`);
@@ -1810,14 +1983,34 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               activePages.delete(page);
               await pageSlot.discard(Math.max(0, Math.min(2000, deadline - Date.now())));
               log('INFO', `${logPrefix} page cleanup 완료`);
+              if (hydrationStall) {
+                hydrationStallCount += 1;
+                consecutiveHydrationStalls += 1;
+                if (hydrationRecoveryCount >= hydrationMaxRetries) break;
+                if (!hydrationResumeQueue.includes(index)) hydrationResumeQueue.push(index);
+                deferredHydration = true;
+                if (consecutiveHydrationStalls >= 2) {
+                  await closeDetailBrowserSession(detailSession);
+                  const backoffMs = config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS;
+                  log('WARN', `연속 hydration stall ${consecutiveHydrationStalls}회 감지, 남은 순회를 중단하고 ${Math.round(backoffMs / 1000)}초 cooldown 후 실패 지점부터 재개합니다.`);
+                  await sleep(backoffMs);
+                  detailSession = await createDetailBrowserSession(config);
+                  detailContext = detailSession.context;
+                  pageSlot = createDetailPageSlot(detailContext);
+                  retryQueue.unshift(...hydrationResumeQueue.splice(0));
+                  consecutiveHydrationStalls = 0;
+                  hydrationRecoveryCount += 1;
+                }
+                break;
+              }
               if (downgradedToSerial && workerId !== 1) {
                 retryQueue.push(index);
                 return;
               }
-              if (hydrationStall && attempt < maxAttempts) await sleep(2500);
               if (lastError.reason === 'detail hard timeout') break;
             }
           }
+          if (deferredHydration) continue;
           if (lastError) {
             const durationMs = Date.now() - productStartedAt;
             detailDurationsMs.push(durationMs);
@@ -1847,7 +2040,11 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       error.failures = failures;
       throw error;
     }
-    return validateCatalog(normalizeCatalog(products));
+    const result = buildHybridResult(products);
+    result.hybridSummary.hydrationStallCount = hydrationStallCount;
+    result.hybridSummary.detailTargetCount = urls.length;
+    result.hybridSummary.detailSuccessCount = products.filter(Boolean).length;
+    return result;
   } finally {
     await closeDetailBrowserSession(detailSession);
   }
@@ -2025,8 +2222,17 @@ async function runOnce(options = {}) {
     }
 
     let catalog;
+    let hybridState = {};
     try {
-      catalog = validateCatalog(normalizeCatalog(await deps.fetchCatalog(config.notionPageUrl, config)));
+      const fetched = await deps.fetchCatalog(config.notionPageUrl, {
+        ...config, previousState, hybridNow: deps.now()
+      });
+      hybridState = {
+        productMetadata: fetched.productMetadata || previousState?.productMetadata || {},
+        lastFullDetailScanAt: fetched.lastFullDetailScanAt || previousState?.lastFullDetailScanAt || null,
+        hybridSummary: fetched.hybridSummary || null
+      };
+      catalog = validateCatalog(normalizeCatalog(fetched));
     } catch (error) {
       const fetchError = createPageFetchError(error);
       await recordPageFetchFailure(config, deps, fetchError.reason);
@@ -2041,10 +2247,12 @@ async function runOnce(options = {}) {
       await saveStateWithLog(config.stateFile, {
         hash,
         catalog,
+        ...hybridState,
         checkedAt,
         changedAt: null
       });
       log('INFO', '최초 상태를 저장했습니다.');
+      if (hybridState.hybridSummary) log('INFO', `실행 요약: ${JSON.stringify({ ...hybridState.hybridSummary, changedProducts: 0 })}`);
       return 0;
     }
 
@@ -2053,15 +2261,18 @@ async function runOnce(options = {}) {
         ...previousState,
         hash,
         catalog,
+        ...hybridState,
         checkedAt,
         changedAt: previousState.changedAt || null
       });
       log('INFO', '변경 사항이 없습니다.');
+      if (hybridState.hybridSummary) log('INFO', `실행 요약: ${JSON.stringify({ ...hybridState.hybridSummary, changedProducts: 0 })}`);
       return 0;
     }
 
     log('INFO', '상품 변경을 감지했습니다.');
     const diff = diffCatalog(previousState.catalog || { products: [] }, catalog);
+    if (hybridState.hybridSummary) log('INFO', `실행 요약: ${JSON.stringify({ ...hybridState.hybridSummary, changedProducts: diff.length })}`);
     const diffText = formatCatalogDiff(diff);
     try {
       await deps.sendNotification(config, checkedAt, previousState.catalog?.products?.length || 0, catalog.products.length, diffText);
@@ -2072,7 +2283,7 @@ async function runOnce(options = {}) {
     }
 
     await saveChangeArtifacts(config.snapshotDir, checkedAt, catalog, diff);
-    await saveStateWithLog(config.stateFile, { hash, catalog, checkedAt, changedAt: checkedAt });
+    await saveStateWithLog(config.stateFile, { hash, catalog, ...hybridState, checkedAt, changedAt: checkedAt });
     log('INFO', '새로운 상태를 저장했습니다.');
     return 0;
   } catch (error) {
@@ -2167,6 +2378,8 @@ module.exports = {
   validateCatalog,
   normalizeProduct,
   normalizeCatalog,
+  parseProductCard,
+  buildHybridDetailPlan,
   serializeCatalog,
   diffCatalog,
   collectProductCardCandidates,
@@ -2182,6 +2395,8 @@ module.exports = {
   closePageSafely,
   createDetailPageSlot,
   processDetailPage,
+  collectDetailSnapshot,
+  isUsableDetailSnapshot,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
   benchmarkDetailMode,

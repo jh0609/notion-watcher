@@ -9,7 +9,8 @@ const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveConfig, resolveDebugConfig, waitForProductCards,
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
-  processDetailPage, createDetailPageSlot, buildDetailContextSettings, runOnce
+  processDetailPage, createDetailPageSlot, buildDetailContextSettings, parseProductCard, buildHybridDetailPlan,
+  isUsableDetailSnapshot, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -43,6 +44,46 @@ test('상품과 캐릭터 DOM 순서가 달라도 직렬화 JSON과 해시는 �
   ]);
   assert.equal(serializeCatalog(a), serializeCatalog(b));
   assert.deepEqual(a.products[0].characters.map((item) => item.name), ['캐릭터 A', '캐릭터 B']);
+});
+
+test('상세 옵션 8개 중 카드에 6개가 노출된 상품은 requiresDetail=true다', () => {
+  const variants = ['가', '나', '다', '라', '마', '바'].map((name) => `${name} (판매 중)`).join(' ');
+  const card = parseProductCard({
+    innerText: `도트 디폼블럭 12,000원 일부 상품 품절 ${variants} +2개`,
+    hrefs: ['/5273f4a9f62683e5b87581c092c3aff2?pvs=25'], blockId: '', pageId: ''
+  }, 'https://shop.notion.site/catalog');
+  assert.equal(card.visibleVariantCount, 6);
+  assert.equal(card.totalVariantCount, 8);
+  assert.equal(card.requiresDetail, true);
+});
+
+test('UUID가 일치하고 본문이 20자 이상이면 readyState와 무관하게 usable하다', () => {
+  assert.equal(isUsableDetailSnapshot({
+    expectedPageIdMatched: true, documentReadyState: 'interactive', bodyTextLength: 187
+  }), true);
+});
+
+test('변경 없는 작은 카드는 6시간 전까지 이전 상세 옵션을 재사용한다', () => {
+  const mainUrl = 'https://shop.notion.site/catalog';
+  const candidate = {
+    innerText: '상품 A 10,000원 판매 중 가 (판매 중)',
+    hrefs: ['/5273f4a9f62683e5b87581c092c3aff2'], blockId: '', pageId: ''
+  };
+  const card = parseProductCard(candidate, mainUrl);
+  const checkedAt = '2026-07-17T00:00:00.000Z';
+  const previousState = {
+    lastFullDetailScanAt: checkedAt,
+    productMetadata: { [card.url]: {
+      cardHash: card.cardHash, totalVariantCount: 1, lastDetailCheckedAt: checkedAt,
+      fullVariants: [{ name: '가', status: 'for_sale' }]
+    } },
+    catalog: { products: [] }
+  };
+  const plan = buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState,
+    new Date('2026-07-17T01:00:00.000Z'), {
+      notionPageUrl: mainUrl, detailFullScanIntervalMs: 21_600_000, detailRecheckIntervalMs: 21_600_000
+    });
+  assert.deepEqual(plan.detailUrls, []);
 });
 
 test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff한다', () => {
@@ -248,62 +289,48 @@ test('20초 navigation timeout은 page.goto에 직접 적용되어 20~25초 안�
   assert.ok(elapsedMs >= 19_500 && elapsedMs <= 25_000, `elapsed=${elapsedMs}ms`);
 });
 
-test('10초 ready timeout은 세 번째 인수로 전달되어 약 10초 안에 반환된다', { timeout: 15_000 }, async () => {
-  let receivedArgument;
-  let receivedOptions;
+test('ready polling은 timeout 안에 usable snapshot이 없으면 반환된다', async () => {
   const page = {
     setDefaultNavigationTimeout: () => undefined,
     setDefaultTimeout: () => undefined,
     isClosed: () => false,
     close: async () => undefined,
     goto: async () => undefined,
-    waitForFunction: async (_fn, argument, options) => {
-      receivedArgument = argument;
-      receivedOptions = options;
-      await new Promise((resolve) => setTimeout(resolve, options.timeout));
-      const error = new Error(`Timeout ${options.timeout}ms exceeded`);
-      error.name = 'TimeoutError';
-      throw error;
-    },
-    evaluate: async () => ({ bodyTextLength: 20, priceMatched: false, statusMatched: false })
+    waitForTimeout: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    evaluate: async () => ({ expectedPageIdMatched: true, documentReadyState: 'interactive', bodyTextLength: 0 })
   };
   const startedAt = Date.now();
   await assert.rejects(processDetailPage(page, 'https://example.test/5273f4a9f62683e5b87581c092c3aff2', {
     detailNavigationTimeoutMs: 20_000,
-    detailReadyTimeoutMs: 10_000,
+    detailReadyTimeoutMs: 50,
+    detailReadyPollIntervalMs: 10,
     detailHardTimeoutMs: 35_000
-  }, 'ready-timeout-test'), /Timeout 10000ms/);
+  }, 'ready-timeout-test'), /hydration stall/);
   const elapsedMs = Date.now() - startedAt;
-  assert.equal(receivedArgument.expectedPageId, '5273f4a9f62683e5b87581c092c3aff2');
-  assert.deepEqual(receivedOptions, { timeout: 10_000 });
-  assert.ok(elapsedMs >= 9_500 && elapsedMs <= 13_000, `elapsed=${elapsedMs}ms`);
+  assert.ok(elapsedMs >= 40 && elapsedMs <= 500, `elapsed=${elapsedMs}ms`);
 });
 
-test('가격과 상태가 없어도 UUID, readyState, 본문 20자로 ready 조건을 통과한다', async () => {
-  let readyFunctionSource = '';
+test('본문이 나타난 뒤 500ms 이내에 polling ready가 완료된다', async () => {
+  let snapshots = 0;
+  const startedAt = Date.now();
   const page = {
     setDefaultNavigationTimeout: () => undefined,
     setDefaultTimeout: () => undefined,
     goto: async () => undefined,
-    waitForFunction: async (fn, argument, options) => {
-      readyFunctionSource = fn.toString();
-      assert.equal(argument.expectedPageId, '5273f4a9f62683e5b87581c092c3aff2');
-      assert.deepEqual(options, { timeout: 10_000 });
-    },
-    evaluate: async () => ({
-      title: '상품 A', text: '가격 상태 없이도 충분히 유의미한 상세 본문이 렌더링되어 있습니다.', rowTexts: []
-    }),
+    evaluate: async (fn) => fn.toString().includes('documentReadyState')
+      ? { expectedPageIdMatched: true, documentReadyState: 'interactive', bodyTextLength: ++snapshots >= 2 ? 187 : 0 }
+      : { title: '상품 A', text: '상품 A 10,000원 판매 중', rowTexts: [] },
     url: () => 'https://example.test/5273f4a9f62683e5b87581c092c3aff2',
-    waitForTimeout: async () => undefined,
+    waitForTimeout: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     isClosed: () => false,
     close: async () => undefined
   };
-  await assert.rejects(processDetailPage(page, page.url(), {
-    detailNavigationTimeoutMs: 20_000, detailReadyTimeoutMs: 10_000, detailHardTimeoutMs: 35_000
-  }, 'ready-condition-test'), /product price not found/);
-  assert.match(readyFunctionSource, /readyState !== 'loading'/);
-  assert.match(readyFunctionSource, /length >= 20/);
-  assert.doesNotMatch(readyFunctionSource, /판매|SOLD|원/);
+  const result = await processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 20_000, detailReadyTimeoutMs: 1000,
+    detailReadyPollIntervalMs: 250, detailHardTimeoutMs: 35_000
+  }, 'ready-condition-test');
+  assert.equal(result.price, '10,000원');
+  assert.ok(Date.now() - startedAt < 500);
 });
 
 test('parse 결과가 불완전하면 1초 대기 후 한 번 재파싱한다', async () => {
@@ -314,7 +341,10 @@ test('parse 결과가 불완전하면 1초 대기 후 한 번 재파싱한다', 
     setDefaultTimeout: () => undefined,
     goto: async () => undefined,
     waitForFunction: async () => undefined,
-    evaluate: async () => {
+    evaluate: async (fn) => {
+      if (fn.toString().includes('documentReadyState')) return {
+        expectedPageIdMatched: true, documentReadyState: 'interactive', bodyTextLength: 30
+      };
       evaluateCalls += 1;
       return evaluateCalls === 1
         ? { title: '상품 A', text: '상세 본문만 먼저 표시되었습니다.', rowTexts: [] }
@@ -338,7 +368,7 @@ test('interactive 상태에서 본문이 0자면 hydration stall로 분류한다
     setDefaultNavigationTimeout: () => undefined,
     setDefaultTimeout: () => undefined,
     goto: async () => undefined,
-    waitForFunction: async () => { throw new Error('ready timeout'); },
+    waitForTimeout: async () => undefined,
     evaluate: async () => ({
       currentUrl: 'https://example.test/5273f4a9f62683e5b87581c092c3aff2',
       documentReadyState: 'interactive', bodyTextLength: 0, bodyTextPreview: '',
@@ -363,11 +393,12 @@ test('hard timeout은 page를 닫고 이전 attempt가 정착한 뒤 반환한�
     isClosed: () => closed,
     close: async () => { closed = true; },
     goto: async () => undefined,
-    waitForFunction: async () => {
+    evaluate: async () => {
       await new Promise((resolve) => setTimeout(resolve, 80));
       underlyingSettled = true;
       throw new Error('late ready failure');
-    }
+    },
+    waitForTimeout: async () => undefined
   };
   const originalLog = console.log;
   const captured = [];

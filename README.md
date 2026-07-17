@@ -58,12 +58,15 @@ SNAPSHOT_DIR=./snapshots
 DETAIL_CONCURRENCY=1
 DETAIL_NAVIGATION_TIMEOUT_MS=20000
 DETAIL_READY_TIMEOUT_MS=10000
+DETAIL_READY_POLL_INTERVAL_MS=250
 DETAIL_HARD_TIMEOUT_MS=35000
 DETAIL_REUSE_PAGES=true
 DETAIL_BLOCK_HEAVY_RESOURCES=true
 DETAIL_SERVICE_WORKERS=block
 DETAIL_HYDRATION_BACKOFF_MS=50000
 DETAIL_HYDRATION_MAX_RETRIES=1
+DETAIL_RECHECK_INTERVAL_MS=21600000
+DETAIL_FULL_SCAN_INTERVAL_MS=21600000
 MAIN_TO_DETAIL_DELAY_MS=10000
 DEBUG_DOM=false
 DEBUG_DIR=./debug
@@ -83,6 +86,8 @@ OPERATOR_NTFY_TOPIC=
 `SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 1GB 서버를 고려한 기본값은 `1`입니다. 동시성 `2`의 첫 두 page가 모두 hydration stall이면 실행 중 자동으로 `1`로 낮춥니다.
 
 상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. 기본적으로 `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 항상 허용합니다. `DETAIL_BLOCK_HEAVY_RESOURCES=false`이면 이미지·미디어·폰트도 허용합니다. `DETAIL_SERVICE_WORKERS=block|allow`로 Service Worker 정책을 비교할 수 있습니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
+
+상세 ready는 `DETAIL_READY_POLL_INTERVAL_MS`(기본 `250`) 간격으로 UUID 일치와 본문 20자 이상만 확인합니다. 카드 해시가 유지된 상품은 이전 전체 옵션을 재사용하며, `DETAIL_RECHECK_INTERVAL_MS` 및 `DETAIL_FULL_SCAN_INTERVAL_MS`의 기본값인 6시간마다 상세 검증합니다.
 
 메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `10000`)만큼 기다린 다음 별도의 상세 browser/context를 생성합니다. 첫 URL preflight가 hydration stall이면 그 세션을 완전히 종료하고 `DETAIL_HYDRATION_BACKOFF_MS`(기본 `50000`) 후 새 세션으로 재시도합니다. 재시도 횟수는 `DETAIL_HYDRATION_MAX_RETRIES`(기본 `1`)로 제한하며, 성공한 preflight 결과는 첫 상품 결과로 재사용합니다.
 
