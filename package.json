@@ -6,6 +6,7 @@
   "main": "notion-watcher-once.js",
   "scripts": {
     "start": "node notion-watcher-once.js",
+    "dry-run": "node notion-watcher-once.js --dry-run",
     "debug:cards": "node notion-watcher-once.js --debug-cards",
     "benchmark:details": "node notion-watcher-once.js --benchmark-details",
     "debug:detail": "node notion-watcher-once.js --debug-detail",

@@ -1108,20 +1108,65 @@ function parseCardVisibleVariants(text, optionRowTexts = []) {
     .sort((a, b) => a.name.localeCompare(b.name, 'ko-KR') || a.status.localeCompare(b.status));
 }
 
-function normalizeProduct(product) {
-  const characterMap = new Map((product.characters || []).map((character) => [normalizeValue(character.name), {
-    name: normalizeValue(character.name),
-    status: normalizeStatus(character.status)
+function normalizeVariants(variants) {
+  const variantMap = new Map((Array.isArray(variants) ? variants : []).map((variant) => [normalizeValue(variant?.name), {
+    name: normalizeValue(variant?.name),
+    status: normalizeStatus(variant?.status)
   }]));
-  const characters = [...characterMap.values()].filter((character) => character.name).sort((a, b) =>
+  return [...variantMap.values()].filter((variant) => variant.name).sort((a, b) =>
     a.name.localeCompare(b.name, 'ko-KR') || a.status.localeCompare(b.status, 'ko-KR'));
+}
+
+function normalizeProduct(product) {
+  const legacy = !Array.isArray(product.visibleVariants) || !Array.isArray(product.fullVariants) ||
+    !Number.isInteger(product.visibleVariantCount) || !Number.isInteger(product.totalVariantCount);
+  const legacyVariants = normalizeVariants(product.characters);
+  const visibleVariants = legacy ? legacyVariants : normalizeVariants(product.visibleVariants);
+  const fullVariants = legacy ? legacyVariants : normalizeVariants(product.fullVariants);
+  const visibleVariantCount = legacy ? visibleVariants.length : product.visibleVariantCount;
+  const totalVariantCount = legacy ? fullVariants.length : product.totalVariantCount;
+  const hiddenVariantCount = legacy ? 0 : Math.max(0, Number.isInteger(product.hiddenVariantCount)
+    ? product.hiddenVariantCount : totalVariantCount - visibleVariantCount);
+  const url = canonicalizeUrl(product.url, product.url);
   return {
-    url: canonicalizeUrl(product.url, product.url),
+    pageId: normalizeValue(product.pageId) || extractNotionPageId(url, url) || '',
+    url,
     name: normalizeValue(product.name),
     price: normalizeValue(product.price).replace(/\s+/g, ''),
     status: normalizeStatus(product.status),
-    characters
+    characters: fullVariants,
+    visibleVariants,
+    fullVariants,
+    visibleVariantCount,
+    totalVariantCount,
+    hiddenVariantCount,
+    knownHiddenVariants: legacy ? false : Boolean(product.knownHiddenVariants),
+    cardParseComplete: legacy ? false : Boolean(product.cardParseComplete),
+    cardHash: normalizeValue(product.cardHash),
+    detailReason: legacy ? 'legacy-state-migration' : (product.detailReason == null ? null : normalizeValue(product.detailReason)),
+    detailSource: legacy ? 'legacy' : (['card', 'detail', 'legacy'].includes(product.detailSource) ? product.detailSource : 'card'),
+    lastDetailCheckedAt: legacy ? null : (product.lastDetailCheckedAt || null)
   };
+}
+
+function validateCatalogMetadata(catalog) {
+  validateCatalog(catalog);
+  for (const product of catalog.products) {
+    const invalid = [];
+    if (!normalizeValue(product.pageId)) invalid.push('pageId');
+    if (!Array.isArray(product.visibleVariants)) invalid.push('visibleVariants');
+    if (!Array.isArray(product.fullVariants)) invalid.push('fullVariants');
+    if (!Number.isInteger(product.visibleVariantCount)) invalid.push('visibleVariantCount');
+    if (!Number.isInteger(product.totalVariantCount)) invalid.push('totalVariantCount');
+    if (!Number.isInteger(product.hiddenVariantCount) || product.hiddenVariantCount < 0) invalid.push('hiddenVariantCount');
+    if (typeof product.knownHiddenVariants !== 'boolean') invalid.push('knownHiddenVariants');
+    if (typeof product.cardParseComplete !== 'boolean') invalid.push('cardParseComplete');
+    if (product.detailReason !== null && typeof product.detailReason !== 'string') invalid.push('detailReason');
+    if (!['card', 'detail', 'legacy'].includes(product.detailSource)) invalid.push('detailSource');
+    if (invalid.length) throw new PageFetchError('catalog metadata validation failed',
+      `${product.name || product.url}: ${invalid.join(', ')}`);
+  }
+  return catalog;
 }
 
 function normalizeCatalog(products) {
@@ -1241,7 +1286,8 @@ async function collectProductCardCandidates(page) {
     const all = [...document.querySelectorAll('div, article, li, a, button, [role]')];
     const scored = all.map((element) => {
       const style = getComputedStyle(element);
-      const text = clean(element.innerText || element.textContent || '');
+      const rawInnerText = element.innerText || element.textContent || '';
+      const text = clean(rawInnerText);
       const role = element.getAttribute('role') || '';
       const className = typeof element.className === 'string' ? element.className : '';
       const hasImage = Boolean(element.querySelector('img, [role="img"], [style*="background-image"]'));
@@ -1259,7 +1305,7 @@ async function collectProductCardCandidates(page) {
       if (hasIds) score += 2;
       if (hasImage && hasText) score += 2;
       if (role === 'button' || role === 'link') score += 1;
-      return { element, score, text, role, className, hasImage, hasProductText, clickable, galleryLike, collectionItem };
+      return { element, score, text, rawInnerText, role, className, hasImage, hasProductText, clickable, galleryLike, collectionItem };
     }).filter((item) => item.text && (
       item.collectionItem || (item.hasProductText && item.hasImage && item.clickable && item.text.length <= 500)
     ));
@@ -1271,8 +1317,17 @@ async function collectProductCardCandidates(page) {
     }
     return selected.map((item, index) => {
       item.element.setAttribute('data-notion-watcher-card-id', `${index}`);
+      const optionPattern = /^([^()（）\r\n]+?)\s*[\(（]\s*(일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)\s*[\)）]$/i;
+      const statusPatternExact = /^(일부\s*(?:상품\s*)?품절|일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)$/i;
+      const optionRowTexts = [...new Set([...item.element.querySelectorAll('*')].map((node) =>
+        `${node.textContent || ''}`.normalize('NFKC').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim()
+      ).filter((candidate) => {
+        const match = candidate.match(optionPattern);
+        return match && !statusPatternExact.test(match[1].trim()) && !/\d{1,3}(?:,\d{3})*\s*원/.test(match[1]);
+      }))];
       return {
-        id: index, score: item.score, outerHTML: item.element.outerHTML.slice(0, 4000), innerText: item.text,
+        id: index, score: item.score, outerHTML: item.element.outerHTML.slice(0, 4000), innerText: item.rawInnerText,
+        optionRowTexts,
         role: item.role, class: item.className, blockId: item.element.getAttribute('data-block-id') || '',
         pageId: item.element.getAttribute('data-page-id') || '', pageUrl: location.href,
         hrefs: [...new Set([item.element.getAttribute('href') || '',
@@ -1859,7 +1914,9 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       const fullVariants = detailVariants || card.characters;
       const totalVariantCount = detail ? detailVariants.length : card.visibleVariantCount;
       const hiddenVariantCount = Math.max(0, totalVariantCount - card.visibleVariantCount);
-      const knownHiddenVariants = hiddenVariantCount > 0 || Boolean(previous?.knownHiddenVariants && !detail);
+      const knownHiddenVariants = hiddenVariantCount > 0;
+      const detailReason = hybridPlan.detailReasonByUrl[card.url] || null;
+      const lastDetailCheckedAt = detail ? hybridNow.toISOString() : null;
       if (!detail) cardOnlyCount += 1;
       metadata[card.url] = {
         id: extractNotionPageId(card.url, card.url) || card.url,
@@ -1873,19 +1930,31 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
         hiddenVariantCount,
         knownHiddenVariants,
         cardParseComplete: !card.cardIncomplete,
-        detailReason: hybridPlan.detailReasonByUrl[card.url] || null,
-        lastDetailCheckedAt: detail ? hybridNow.toISOString() : previous?.lastDetailCheckedAt || null,
+        detailReason,
+        lastDetailCheckedAt,
         fullVariants: normalizeProduct({ characters: fullVariants }).characters
       };
       return {
+        pageId: extractNotionPageId(card.url, card.url) || '',
         url: card.url,
         name: detail?.name || card.name || previousProduct?.name || '',
         price: detail?.price || card.price || previousProduct?.price || '',
         status: detail?.status || card.status || previousProduct?.status || '',
-        characters: fullVariants
+        characters: fullVariants,
+        visibleVariants: card.characters,
+        fullVariants,
+        visibleVariantCount: card.visibleVariantCount,
+        totalVariantCount,
+        hiddenVariantCount,
+        knownHiddenVariants,
+        cardParseComplete: !card.cardIncomplete,
+        cardHash: card.cardHash,
+        detailReason,
+        detailSource: detail ? 'detail' : 'card',
+        lastDetailCheckedAt
       };
     });
-    const catalog = validateCatalog(normalizeCatalog(combined));
+    const catalog = validateCatalogMetadata(normalizeCatalog(combined));
     catalog.productMetadata = metadata;
     catalog.lastFullDetailScanAt = (hybridPlan.firstFullRun || hybridPlan.fullScanDue)
       ? hybridNow.toISOString() : config.previousState?.lastFullDetailScanAt || null;
@@ -2543,6 +2612,10 @@ async function runOnce(options = {}) {
     let previousState;
     try {
       previousState = await readState(config.stateFile);
+      if (previousState) {
+        await fs.copyFile(path.resolve(config.stateFile), `${path.resolve(config.stateFile)}.backup`);
+        log('INFO', `기존 state 백업 완료: ${path.resolve(config.stateFile)}.backup`);
+      }
     } catch (error) {
       log('ERROR', '상태 파일 읽기에 실패했습니다.');
       throw error;
@@ -2559,7 +2632,7 @@ async function runOnce(options = {}) {
         lastFullDetailScanAt: fetched.lastFullDetailScanAt || previousState?.lastFullDetailScanAt || null,
         hybridSummary: fetched.hybridSummary || null
       };
-      catalog = validateCatalog(normalizeCatalog(fetched));
+      catalog = validateCatalogMetadata(normalizeCatalog(fetched));
     } catch (error) {
       const fetchError = createPageFetchError(error);
       await recordPageFetchFailure(config, deps, fetchError.reason);
@@ -2577,6 +2650,15 @@ async function runOnce(options = {}) {
       }
       throw fetchError;
     }
+    const metadataSummary = {
+      totalProducts: catalog.products.length,
+      withVisibleCount: catalog.products.filter((product) => Number.isInteger(product.visibleVariantCount)).length,
+      withTotalCount: catalog.products.filter((product) => Number.isInteger(product.totalVariantCount)).length,
+      withKnownHidden: catalog.products.filter((product) => typeof product.knownHiddenVariants === 'boolean').length,
+      withCardParseComplete: catalog.products.filter((product) => typeof product.cardParseComplete === 'boolean').length
+    };
+    log('INFO', `저장 예정 메타데이터 요약: ${JSON.stringify(metadataSummary)}`);
+    if (config.debugDom) log('DEBUG', `저장 예정 상품: ${JSON.stringify(catalog.products, null, 2)}`);
     await recordPageFetchSuccess(config, deps);
     const json = serializeCatalog(catalog);
     const hash = createHash(json);
@@ -2649,7 +2731,10 @@ async function runOnce(options = {}) {
 
 async function saveStateWithLog(stateFile, state) {
   try {
+    if (state.catalog) validateCatalogMetadata(state.catalog);
     await saveStateAtomic(stateFile, state);
+    const roundTrip = await readState(stateFile);
+    if (roundTrip?.catalog) validateCatalogMetadata(roundTrip.catalog);
     log('INFO', '상태 파일 저장에 성공했습니다.');
   } catch (error) {
     log('ERROR', '상태 파일 저장에 실패했습니다.');
@@ -2657,8 +2742,43 @@ async function saveStateWithLog(stateFile, state) {
   }
 }
 
+async function dryRun() {
+  const config = resolveConfig({
+    ...process.env,
+    NOTION_PAGE_URL: process.env.NOTION_PAGE_URL || 'https://flaxen-catshark-648.notion.site/MD-3973f4a9f62680f39ddafca527725466',
+    NTFY_SERVER_URL: process.env.NTFY_SERVER_URL || 'https://ntfy.invalid',
+    NTFY_TOPIC: process.env.NTFY_TOPIC || 'dry-run',
+    NTFY_TOKEN: process.env.NTFY_TOKEN || 'dry-run'
+  });
+  const previousState = await readState(config.stateFile);
+  log('INFO', 'dry-run 시작: state와 ntfy는 변경하지 않습니다.');
+  const fetched = await fetchProductCatalog(config.notionPageUrl, {
+    ...config, previousState, hybridNow: new Date()
+  });
+  const catalog = validateCatalogMetadata(normalizeCatalog(fetched));
+  const summary = fetched.hybridSummary || {};
+  log('INFO', `dry-run 실행 요약: ${JSON.stringify(summary)}`);
+  log('INFO', `dry-run 메타데이터 요약: ${JSON.stringify({
+    totalProducts: catalog.products.length,
+    withVisibleCount: catalog.products.filter((product) => Number.isInteger(product.visibleVariantCount)).length,
+    withTotalCount: catalog.products.filter((product) => Number.isInteger(product.totalVariantCount)).length,
+    withKnownHidden: catalog.products.filter((product) => typeof product.knownHiddenVariants === 'boolean').length,
+    withCardParseComplete: catalog.products.filter((product) => typeof product.cardParseComplete === 'boolean').length
+  })}`);
+  for (const product of catalog.products) {
+    log('INFO', `dry-run 상품: ${product.name} detailReason=${product.detailReason || 'none'} ` +
+      `source=${product.detailSource} visible=${product.visibleVariantCount} total=${product.totalVariantCount} hidden=${product.hiddenVariantCount}`);
+  }
+  return catalog;
+}
+
 if (require.main === module) {
-  if (process.argv.includes('--analyze-card-detail')) {
+  if (process.argv.includes('--dry-run')) {
+    dryRun().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--analyze-card-detail')) {
     analyzeCardDetail().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -2720,6 +2840,7 @@ module.exports = {
   resolveCardProductUrl,
   evaluateProductUrlCandidate,
   validateCatalog,
+  validateCatalogMetadata,
   normalizeProduct,
   normalizeCatalog,
   parseProductCard,
@@ -2757,6 +2878,8 @@ module.exports = {
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
+  dryRun,
+  saveStateWithLog,
   runOnce,
   isLockStaleOrInvalid,
   createDesktopUserAgent,

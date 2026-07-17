@@ -10,7 +10,8 @@ const {
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveConfig, resolveDebugConfig, waitForProductCards,
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
   processDetailPage, createDetailPageSlot, buildDetailContextSettings, parseProductCard, buildHybridDetailPlan,
-  isUsableDetailSnapshot, shouldTripHydrationCircuitBreaker, advanceHydrationCircuitState, runOnce
+  isUsableDetailSnapshot, shouldTripHydrationCircuitBreaker, advanceHydrationCircuitState, runOnce,
+  validateCatalogMetadata, saveStateWithLog
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -25,7 +26,7 @@ async function config() {
 }
 
 const product = (overrides = {}) => ({
-  url: 'https://example.test/p/1', name: '상품 A', price: '10,000 원', status: 'FOR SALE',
+  url: 'https://example.test/11111111111111111111111111111111', name: '상품 A', price: '10,000 원', status: 'FOR SALE',
   characters: [{ name: '캐릭터 B', status: '품절' }, { name: '캐릭터 A', status: '판매 중' }], ...overrides
 });
 
@@ -37,9 +38,9 @@ test('debug:cards 스크린샷 저장은 기본적으로 비활성화되고 명�
 });
 
 test('상품과 캐릭터 DOM 순서가 달라도 직렬화 JSON과 해시는 안정적이다', () => {
-  const a = normalizeCatalog([product(), product({ url: 'https://example.test/p/2', name: '상품 B' })]);
+  const a = normalizeCatalog([product(), product({ url: 'https://example.test/22222222222222222222222222222222', name: '상품 B' })]);
   const b = normalizeCatalog([
-    product({ url: 'https://example.test/p/2', name: '상품 B', characters: [...product().characters].reverse() }),
+    product({ url: 'https://example.test/22222222222222222222222222222222', name: '상품 B', characters: [...product().characters].reverse() }),
     product({ characters: [...product().characters].reverse() })
   ]);
   assert.equal(serializeCatalog(a), serializeCatalog(b));
@@ -160,6 +161,29 @@ test('신규 상품의 카드 필수 필드가 누락되면 상세 조회한다'
     hrefs: ['/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], blockId: '', pageId: '' };
   const plan = hybridPlanForCandidate(candidate);
   assert.equal(plan.detailReasonByUrl[plan.detailUrls[0]], 'card-parse-incomplete');
+});
+
+test('최초 실행의 검증된 34개 분포는 card-only 29, visible-limit 4, UNKNOWN 1이다', () => {
+  const mainUrl = 'https://shop.notion.site/catalog';
+  const candidates = [];
+  for (let index = 0; index < 29; index += 1) {
+    const id = `${index + 1}`.padStart(32, '0');
+    candidates.push({ innerText: `카드 상품 ${index}\n10,000원\n판매 중`, optionRowTexts: [], hrefs: [`/${id}`] });
+  }
+  for (let index = 0; index < 4; index += 1) {
+    const id = `${100 + index}`.padStart(32, '0');
+    const rows = ['가', '나', '다', '라', '마', '바'].map((name) => `${name} (판매 중)`);
+    candidates.push({ innerText: `상세 상품 ${index}\n10,000원\n판매 중\n${rows.join('\n')}`, optionRowTexts: rows, hrefs: [`/${id}`] });
+  }
+  candidates.push({ innerText: '로맨스 판타지 캐릭터 아크릴 스탠드\n19,000원\n판매 중', optionRowTexts: [],
+    hrefs: ['/39f3f4a9f6268046b716ee5e88e71956'] });
+  const urls = candidates.map((candidate) => resolveCardProductUrl(candidate, mainUrl).url);
+  const plan = buildHybridDetailPlan({ urls, candidates }, null, new Date('2026-07-17T00:00:00Z'), { notionPageUrl: mainUrl });
+  const reasons = Object.values(plan.detailReasonByUrl);
+  assert.equal(plan.cards.length - plan.detailUrls.length, 29);
+  assert.equal(reasons.filter((reason) => reason === 'visible-limit-reached').length, 4);
+  assert.equal(reasons.filter((reason) => reason === 'unknown-analysis').length, 1);
+  assert.equal(plan.detailUrls.length, 5);
 });
 
 test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff한다', () => {
@@ -621,7 +645,7 @@ test('변경 시 상태와 전체 스냅샷 및 diff 파일을 저장한다', as
   let notification = '';
   const current = normalizeCatalog([
     product({ status: '품절' }),
-    product({ url: 'https://example.test/p/2', name: '상품 B' })
+    product({ url: 'https://example.test/22222222222222222222222222222222', name: '상품 B' })
   ]);
   const exitCode = await runOnce({ config: cfg, deps: {
     fetchCatalog: async () => current,
@@ -644,4 +668,52 @@ test('상품이 1개만 추출되면 최초 실행에서도 상태 저장을 거
   } });
   assert.equal(exitCode, 1);
   await assert.rejects(fs.access(cfg.stateFile), { code: 'ENOENT' });
+});
+
+test('카드 전용 상품과 상세 상품 메타데이터가 JSON round-trip 후에도 유지된다', () => {
+  const point = {
+    ...product({ name: '포인트 키캡' }), pageId: '11111111111111111111111111111111',
+    visibleVariants: [{ name: '김준호', status: '일시 품절' }, { name: '정예슬', status: '일시 품절' }],
+    fullVariants: [{ name: '김준호', status: '일시 품절' }, { name: '정예슬', status: '일시 품절' }],
+    visibleVariantCount: 2, totalVariantCount: 2, hiddenVariantCount: 0, knownHiddenVariants: false,
+    cardParseComplete: true, cardHash: 'point-hash', detailReason: null, detailSource: 'card', lastDetailCheckedAt: null
+  };
+  const hidden = {
+    ...product({ url: 'https://example.test/22222222222222222222222222222222', name: '숨김 상품' }),
+    pageId: '22222222222222222222222222222222',
+    visibleVariants: Array.from({ length: 6 }, (_, index) => ({ name: `옵션 ${index}`, status: '판매 중' })),
+    fullVariants: Array.from({ length: 8 }, (_, index) => ({ name: `옵션 ${index}`, status: '판매 중' })),
+    visibleVariantCount: 6, totalVariantCount: 8, hiddenVariantCount: 2, knownHiddenVariants: true,
+    cardParseComplete: true, cardHash: 'hidden-hash', detailReason: 'visible-limit-reached',
+    detailSource: 'detail', lastDetailCheckedAt: '2026-07-17T00:00:00.000Z'
+  };
+  const catalog = normalizeCatalog([point, hidden]);
+  validateCatalogMetadata(catalog);
+  const restored = JSON.parse(serializeCatalog(catalog));
+  validateCatalogMetadata(restored);
+  assert.equal(restored.products.find((item) => item.name === '포인트 키캡').detailSource, 'card');
+  const restoredHidden = restored.products.find((item) => item.name === '숨김 상품');
+  assert.equal(restoredHidden.hiddenVariantCount, 2);
+  assert.equal(restoredHidden.knownHiddenVariants, true);
+  assert.equal(restoredHidden.characters.length, 8);
+});
+
+test('legacy 상품은 새 필드를 잃지 않고 보수적인 migration 메타데이터를 얻는다', () => {
+  const migrated = normalizeCatalog([product()]).products[0];
+  assert.equal(migrated.detailSource, 'legacy');
+  assert.equal(migrated.detailReason, 'legacy-state-migration');
+  assert.equal(migrated.cardParseComplete, false);
+  assert.deepEqual(migrated.visibleVariants, migrated.characters);
+  assert.deepEqual(migrated.fullVariants, migrated.characters);
+});
+
+test('필수 메타데이터가 누락된 catalog는 저장 전에 거부되어 기존 state를 유지한다', async () => {
+  const cfg = await config();
+  const previous = { marker: 'keep' };
+  await fs.writeFile(cfg.stateFile, JSON.stringify(previous));
+  await assert.rejects(saveStateWithLog(cfg.stateFile, { catalog: { products: [
+    { url: product().url, name: '상품 A', price: '1원', status: 'for_sale', characters: [] },
+    { url: 'https://example.test/22222222222222222222222222222222', name: '상품 B', price: '2원', status: 'for_sale', characters: [] }
+  ] } }), /metadata validation failed/);
+  assert.deepEqual(JSON.parse(await fs.readFile(cfg.stateFile, 'utf8')), previous);
 });

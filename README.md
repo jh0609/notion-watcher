@@ -34,6 +34,8 @@ npm run check
 npm start
 ```
 
+운영 state와 ntfy를 변경하지 않고 하이브리드 선택 및 저장 예정 메타데이터를 확인하려면 `npm run dry-run`을 실행합니다. 실제 메인 카드와 필요한 상세 페이지만 읽고 상품별 `detailReason`, `detailSource`, 옵션 개수와 선택 요약을 출력합니다.
+
 리눅스 서버에서 Playwright 시스템 의존성이 부족하면 다음 명령이 필요할 수 있습니다.
 
 ```bash
