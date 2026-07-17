@@ -292,6 +292,27 @@ test('parse 결과가 불완전하면 1초 대기 후 한 번 재파싱한다', 
   assert.equal(evaluateCalls, 2);
 });
 
+test('interactive 상태에서 본문이 0자면 hydration stall로 분류한다', async () => {
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    goto: async () => undefined,
+    waitForFunction: async () => { throw new Error('ready timeout'); },
+    evaluate: async () => ({
+      currentUrl: 'https://example.test/5273f4a9f62683e5b87581c092c3aff2',
+      documentReadyState: 'interactive', bodyTextLength: 0, bodyTextPreview: '',
+      priceMatched: false, statusMatched: false,
+      expectedPageId: '5273f4a9f62683e5b87581c092c3aff2', expectedPageIdMatched: true
+    }),
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  await assert.rejects(processDetailPage(page,
+    'https://example.test/5273f4a9f62683e5b87581c092c3aff2', {
+    detailNavigationTimeoutMs: 1000, detailReadyTimeoutMs: 10, detailHardTimeoutMs: 1000
+  }, 'hydration-test'), /hydration stall/);
+});
+
 test('hard timeout은 page를 닫고 이전 attempt가 정착한 뒤 반환한다', async () => {
   let closed = false;
   let underlyingSettled = false;

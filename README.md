@@ -55,11 +55,12 @@ STATE_FILE=./notion-watcher-state.json
 OPERATION_STATE_FILE=./notion-watcher-operation-state.json
 LOCK_FILE=./notion-watcher.lock
 SNAPSHOT_DIR=./snapshots
-DETAIL_CONCURRENCY=2
+DETAIL_CONCURRENCY=1
 DETAIL_NAVIGATION_TIMEOUT_MS=20000
 DETAIL_READY_TIMEOUT_MS=10000
 DETAIL_HARD_TIMEOUT_MS=35000
 DETAIL_REUSE_PAGES=true
+MAIN_TO_DETAIL_DELAY_MS=1500
 DEBUG_DOM=false
 DEBUG_DIR=./debug
 DEBUG_SAVE_SCREENSHOTS=false
@@ -75,9 +76,11 @@ OPERATOR_NTFY_TOPIC=
 
 `NOTION_PAGE_URL`, `NTFY_SERVER_URL`, `NTFY_TOPIC`, `NTFY_TOKEN`은 필수입니다. `STATE_FILE` 기본값은 `./notion-watcher-state.json`, `OPERATION_STATE_FILE` 기본값은 `./notion-watcher-operation-state.json`, `LOCK_FILE` 기본값은 `./notion-watcher.lock`입니다.
 
-`SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 기본값은 `2`입니다.
+`SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 1GB 서버를 고려한 기본값은 `1`입니다. 동시성 `2`의 첫 두 page가 모두 hydration stall이면 실행 중 자동으로 `1`로 낮춥니다.
 
 상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 허용합니다. Service Worker는 차단됩니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 가격과 판매 상태 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
+
+메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `1500`)만큼 기다린 다음 별도의 상세 browser/context를 한 번 생성해 전체 상품에 재사용합니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 
@@ -109,6 +112,14 @@ DETAIL_BENCHMARK_URL=https://example.notion.site/<page-id> npm run benchmark:det
 ```bash
 DETAIL_DIAGNOSTIC_URL=https://example.notion.site/<page-id> npm run debug:detail
 ```
+
+메인 페이지 수집 후 browser를 종료하고 새 상세 browser로 첫 상품을 파싱하는 전체 전환 경로는 다음 명령으로 진단합니다.
+
+```bash
+NOTION_PAGE_URL=https://example.notion.site/<catalog-id> npm run debug:transition
+```
+
+이 명령은 `npm run test:transition`으로도 실행할 수 있으며, 새 상세 browser에서 본문이 비어 있거나 파싱에 실패하면 0이 아닌 종료 코드로 끝나는 실제 페이지 통합 테스트입니다.
 
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 

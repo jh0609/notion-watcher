@@ -4,6 +4,7 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const fs = require('fs/promises');
+const os = require('os');
 const path = require('path');
 
 const DEFAULT_STATE_FILE = './notion-watcher-state.json';
@@ -11,10 +12,11 @@ const DEFAULT_LOCK_FILE = './notion-watcher.lock';
 const DEFAULT_OPERATION_STATE_FILE = './notion-watcher-operation-state.json';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
 const DEFAULT_SNAPSHOT_DIR = './snapshots';
-const DEFAULT_DETAIL_CONCURRENCY = 2;
+const DEFAULT_DETAIL_CONCURRENCY = 1;
 const DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_DETAIL_READY_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_DETAIL_HARD_TIMEOUT_MS = 35 * 1000;
+const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 1500;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
@@ -127,6 +129,7 @@ function resolveConfig(env = process.env) {
   );
   const detailReadyTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS);
   const detailHardTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS);
+  const mainToDetailDelayMs = parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -155,6 +158,7 @@ function resolveConfig(env = process.env) {
     detailReadyTimeoutMs,
     detailHardTimeoutMs,
     detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
+    mainToDetailDelayMs,
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -201,6 +205,21 @@ function resolveSingleDetailConfig(env = process.env) {
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
     detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS)
+  };
+}
+
+function resolveTransitionDiagnosticConfig(env = process.env) {
+  const base = resolveDebugConfig(env);
+  return {
+    ...base,
+    // This diagnostic must exercise the same quiet operational path as a full run.
+    debugDom: false,
+    pageFetchMaxAttempts: parsePositiveIntegerEnv(env, 'PAGE_FETCH_MAX_ATTEMPTS', DEFAULT_PAGE_FETCH_MAX_ATTEMPTS),
+    pageFetchRetryDelaysMs: parseRetryDelaysEnv(env.PAGE_FETCH_RETRY_DELAYS_MS, DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS),
+    detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
+    detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS),
+    mainToDetailDelayMs: parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS)
   };
 }
 
@@ -487,6 +506,17 @@ function getBrowserContextOptions(browser) {
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
     }
+  };
+}
+
+function getMemoryStats() {
+  const usage = process.memoryUsage();
+  return {
+    rss: usage.rss,
+    heapUsed: usage.heapUsed,
+    heapTotal: usage.heapTotal,
+    external: usage.external,
+    osFreeMemory: os.freemem()
   };
 }
 
@@ -1311,6 +1341,28 @@ async function configureDetailResourcePolicy(context) {
   });
 }
 
+function logMemoryStage(stage) {
+  const memory = getMemoryStats();
+  log('INFO', `${stage} 메모리: ${JSON.stringify({ rss: memory.rss, heapUsed: memory.heapUsed, osFreeMemory: memory.osFreeMemory })}`);
+}
+
+async function createDetailBrowserSession() {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch(getChromiumLaunchOptions());
+  log('INFO', '상세 browser 생성 완료');
+  logMemoryStage('상세 browser 생성 완료');
+  try {
+    const context = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
+    await configureDetailResourcePolicy(context);
+    log('INFO', '상세 context 생성 완료');
+    logMemoryStage('상세 context 생성 완료');
+    return { browser, context };
+  } catch (error) {
+    await browser.close();
+    throw error;
+  }
+}
+
 async function closePageSafely(page, timeoutMs = 2000) {
   if (!page || page.isClosed()) return;
   await Promise.race([
@@ -1389,6 +1441,9 @@ async function processDetailPage(page, url, config, logPrefix) {
         }, expectedPageId).catch(() => ({ diagnosticUnavailable: true }));
         log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
         log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
+        if (diagnostic.documentReadyState === 'interactive' && diagnostic.bodyTextLength === 0) {
+          throw new PageFetchError('hydration stall', `readyState=interactive, bodyTextLength=0`);
+        }
       }
       throw error;
     }
@@ -1474,7 +1529,9 @@ async function extractProductDetail(page, url) {
   if (EXTERNAL_SERVICE_TITLE_PATTERNS.some((pattern) => pattern.test(raw.name))) {
     throw new PageFetchError('external service title detected', raw.name);
   }
-  return { url, name: raw.name, price: raw.price, status: raw.status, characters: raw.characters };
+  // Keep the parsed body internally for readiness/transition metrics. Catalog
+  // normalization deliberately drops this field before hashing or persistence.
+  return { url, name: raw.name, price: raw.price, status: raw.status, characters: raw.characters, text: raw.text };
 }
 
 async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
@@ -1518,7 +1575,14 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
       log('WARN', `메인 페이지 조회 ${attempt}/${maxAttempts} 실패: ${lastError.message}`);
       if (attempt < maxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
     } finally {
-      await context.close().catch(() => undefined);
+      if (page) {
+        await closePageSafely(page);
+        log('INFO', `메인 page 종료 완료 (${attempt}/${maxAttempts})`);
+        logMemoryStage('메인 page 종료 완료');
+      }
+      await context.close();
+      log('INFO', `메인 context 종료 완료 (${attempt}/${maxAttempts})`);
+      logMemoryStage('메인 context 종료 완료');
     }
   }
   throw lastError || new PageFetchError('main page fetch failed');
@@ -1526,9 +1590,21 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
 
 async function fetchProductCatalog(notionPageUrl, config = {}) {
   const { chromium } = require('playwright');
-  const browser = await chromium.launch(getChromiumLaunchOptions());
+  const mainBrowser = await chromium.launch(getChromiumLaunchOptions());
+  let urls;
   try {
-    const { urls } = await discoverProductUrlsWithRetries(browser, notionPageUrl, config);
+    ({ urls } = await discoverProductUrlsWithRetries(mainBrowser, notionPageUrl, config));
+  } finally {
+    await mainBrowser.close();
+    log('INFO', '메인 browser 종료 완료');
+    logMemoryStage('메인 browser 종료 완료');
+  }
+
+  await sleep(config.mainToDetailDelayMs || DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
+  const detailSession = await createDetailBrowserSession();
+  const browser = detailSession.browser;
+  const detailContext = detailSession.context;
+  try {
     if (!urls.length) throw new PageFetchError('product detail URLs not found');
 
     const products = new Array(urls.length);
@@ -1538,15 +1614,24 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     const detailDurationsMs = [];
     const reusePages = config.detailReusePages !== false;
     log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
-    const detailContext = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
-    await configureDetailResourcePolicy(detailContext);
     let cursor = 0;
+    const retryQueue = [];
+    const activePages = new Set();
+    let downgradedToSerial = false;
+    const firstWaveOutcomes = new Map();
+    let resolveFirstWave;
+    const firstWaveDone = new Promise((resolve) => { resolveFirstWave = resolve; });
+    const recordFirstWave = (index, hydrationStall) => {
+      if (index > 1 || firstWaveOutcomes.has(index)) return;
+      firstWaveOutcomes.set(index, hydrationStall);
+      if (firstWaveOutcomes.size === Math.min(2, urls.length)) resolveFirstWave();
+    };
     const worker = async (workerIndex) => {
       const workerId = workerIndex + 1;
       const pageSlot = createDetailPageSlot(detailContext);
       try {
-        while (cursor < urls.length) {
-          const index = cursor++;
+        while (retryQueue.length > 0 || cursor < urls.length) {
+          const index = retryQueue.length > 0 ? retryQueue.shift() : cursor++;
           const url = urls[index];
           const position = index + 1;
           const productStartedAt = Date.now();
@@ -1564,15 +1649,20 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
             const allocated = await pageSlot.get(!reusePages);
             const page = allocated.page;
             const pageGeneration = allocated.generation;
+            activePages.add(page);
+            log('INFO', `상세 page 생성/사용: workerId=${workerId}, pageId=${pageGeneration}, 활성=${activePages.size}, 메모리=${JSON.stringify(getMemoryStats())}`);
             const logPrefix = `상세 페이지 조회 ${position}/${urls.length} [workerId=${workerId}, pageId=${pageGeneration}, attempt=${attempt}]`;
             try {
               products[index] = await processDetailPage(page, url, {
                 ...config,
                 detailHardTimeoutMs: Math.min(hardTimeoutMs, remainingMs)
               }, logPrefix);
+              recordFirstWave(index, false);
+              if (index <= 1 && detailConcurrency === 2) await firstWaveDone;
               lastError = null;
               const durationMs = Date.now() - productStartedAt;
               detailDurationsMs.push(durationMs);
+              log('INFO', `상세 동시성 지표: 활성 page=${activePages.size}, bodyTextLength=${products[index].text.length}, 성공=true`);
               log('INFO', `상세 페이지 조회 ${position}/${urls.length} 완료: ${products[index].name} (${(durationMs / 1000).toFixed(1)}초)`);
               if (reusePages) {
                 log('INFO', `${logPrefix} page cleanup 시작 (재사용)`);
@@ -1580,23 +1670,38 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
                 log('INFO', `${logPrefix} page cleanup 완료 (재사용)`);
               } else {
                 log('INFO', `${logPrefix} page cleanup 시작`);
+                activePages.delete(page);
                 await pageSlot.discard();
                 log('INFO', `${logPrefix} page cleanup 완료`);
               }
               break;
             } catch (error) {
               lastError = createPageFetchError(error);
+              const hydrationStall = lastError.reason === 'hydration stall';
+              recordFirstWave(index, hydrationStall);
+              if (index <= 1 && detailConcurrency === 2) await firstWaveDone;
+              if (detailConcurrency === 2 && firstWaveOutcomes.size === 2 && [...firstWaveOutcomes.values()].every(Boolean)) {
+                downgradedToSerial = true;
+                log('WARN', '첫 두 상세 page가 hydration stall이므로 남은 실행을 동시성 1로 낮춥니다.');
+              }
               log('INFO', `${logPrefix} page cleanup 시작`);
+              activePages.delete(page);
               await pageSlot.discard(Math.max(0, Math.min(2000, deadline - Date.now())));
               log('INFO', `${logPrefix} page cleanup 완료`);
+              if (downgradedToSerial && workerId !== 1) {
+                retryQueue.push(index);
+                return;
+              }
+              if (hydrationStall && attempt < maxAttempts) await sleep(2500);
               if (lastError.reason === 'detail hard timeout') break;
             }
           }
           if (lastError) {
             const durationMs = Date.now() - productStartedAt;
             detailDurationsMs.push(durationMs);
-            const reason = lastError.reason || lastError.message || 'unknown error';
-            failures.push({ url, reason });
+          const reason = lastError.reason || lastError.message || 'unknown error';
+          failures.push({ url, reason });
+          log('INFO', `상세 동시성 지표: 활성 page=${activePages.size}, bodyTextLength=0, 성공=false, reason=${reason}`);
             log('WARN', `상세 페이지 조회 ${position}/${urls.length} 실패: ${reason} (${(durationMs / 1000).toFixed(1)}초)`);
           }
         }
@@ -1605,16 +1710,13 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
         if (currentPage.page) {
           const prefix = `workerId=${workerId}, pageId=${currentPage.generation}`;
           log('INFO', `${prefix} page cleanup 시작`);
+          activePages.delete(currentPage.page);
           await pageSlot.discard();
           log('INFO', `${prefix} page cleanup 완료`);
         }
       }
     };
-    try {
-      await Promise.all(Array.from({ length: detailConcurrency }, (_, index) => worker(index)));
-    } finally {
-      await detailContext.close().catch(() => undefined);
-    }
+    await Promise.all(Array.from({ length: detailConcurrency }, (_, index) => worker(index)));
     const elapsedMs = Date.now() - detailStartedAt;
     const averageMs = detailDurationsMs.length ? detailDurationsMs.reduce((sum, value) => sum + value, 0) / detailDurationsMs.length : 0;
     log('INFO', `전체 상세 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초, 상품 평균 ${(averageMs / 1000).toFixed(1)}초`);
@@ -1625,6 +1727,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     }
     return validateCatalog(normalizeCatalog(products));
   } finally {
+    await detailContext.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
   }
 }
@@ -1672,11 +1775,10 @@ async function benchmarkDetails(config = resolveDetailBenchmarkConfig()) {
 }
 
 async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
-  const { chromium } = require('playwright');
-  const browser = await chromium.launch(getChromiumLaunchOptions());
+  const session = await createDetailBrowserSession();
+  const browser = session.browser;
+  const context = session.context;
   try {
-    const context = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
-    await configureDetailResourcePolicy(context);
     const page = await context.newPage();
     try {
       const startedAt = Date.now();
@@ -1689,6 +1791,35 @@ async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
     }
   } finally {
     await browser.close().catch(() => undefined);
+  }
+}
+
+async function diagnoseMainToDetailTransition(config = resolveTransitionDiagnosticConfig()) {
+  const { chromium } = require('playwright');
+  const mainBrowser = await chromium.launch(getChromiumLaunchOptions());
+  let urls;
+  try {
+    ({ urls } = await discoverProductUrlsWithRetries(mainBrowser, config.notionPageUrl, config));
+  } finally {
+    await mainBrowser.close();
+    log('INFO', '메인 browser 종료 완료');
+    logMemoryStage('메인 browser 종료 완료');
+  }
+  await sleep(config.mainToDetailDelayMs);
+  const session = await createDetailBrowserSession();
+  try {
+    const page = await session.context.newPage();
+    try {
+      const product = await processDetailPage(page, urls[0], config, '메인→상세 통합 진단 [workerId=1, pageId=1]');
+      if (!product.text || product.text.length === 0) throw new PageFetchError('transition detail body empty');
+      log('INFO', `메인→상세 통합 진단 성공: bodyTextLength=${product.text.length}, 상품=${product.name}`);
+      return product;
+    } finally {
+      await closePageSafely(page);
+    }
+  } finally {
+    await session.context.close().catch(() => undefined);
+    await session.browser.close().catch(() => undefined);
   }
 }
 
@@ -1858,7 +1989,12 @@ async function saveStateWithLog(stateFile, state) {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--debug-detail')) {
+  if (process.argv.includes('--debug-transition')) {
+    diagnoseMainToDetailTransition().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--debug-detail')) {
     diagnoseSingleDetail().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -1885,6 +2021,7 @@ module.exports = {
   resolveDebugConfig,
   resolveDetailBenchmarkConfig,
   resolveSingleDetailConfig,
+  resolveTransitionDiagnosticConfig,
   acquireLock,
   releaseLock,
   readState,
@@ -1916,6 +2053,7 @@ module.exports = {
   parseProductText,
   shouldAbortDetailResource,
   configureDetailResourcePolicy,
+  createDetailBrowserSession,
   closePageSafely,
   createDetailPageSlot,
   processDetailPage,
@@ -1924,6 +2062,7 @@ module.exports = {
   benchmarkDetailMode,
   benchmarkDetails,
   diagnoseSingleDetail,
+  diagnoseMainToDetailTransition,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
@@ -1938,6 +2077,7 @@ module.exports = {
   DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS,
   DEFAULT_DETAIL_READY_TIMEOUT_MS,
   DEFAULT_DETAIL_HARD_TIMEOUT_MS,
+  DEFAULT_MAIN_TO_DETAIL_DELAY_MS,
   MIN_PRODUCT_COUNT,
   DEFAULT_STALE_LOCK_MS,
   DEFAULT_PAGE_LOAD_TIMEOUT_MS,
