@@ -14,6 +14,7 @@ const DEFAULT_SNAPSHOT_DIR = './snapshots';
 const DEFAULT_DETAIL_CONCURRENCY = 2;
 const DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_DETAIL_READY_TIMEOUT_MS = 10 * 1000;
+const DEFAULT_DETAIL_HARD_TIMEOUT_MS = 35 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
@@ -125,6 +126,7 @@ function resolveConfig(env = process.env) {
     env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS
   );
   const detailReadyTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS);
+  const detailHardTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -151,6 +153,8 @@ function resolveConfig(env = process.env) {
     detailConcurrency,
     detailNavigationTimeoutMs,
     detailReadyTimeoutMs,
+    detailHardTimeoutMs,
+    detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -176,6 +180,16 @@ function resolveDebugConfig(env = process.env) {
     debugDom: true,
     debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR,
     debugSaveScreenshots: parseBooleanEnv(env.DEBUG_SAVE_SCREENSHOTS)
+  };
+}
+
+function resolveDetailBenchmarkConfig(env = process.env) {
+  if (!env.DETAIL_BENCHMARK_URL) throw new Error('필수 환경변수가 누락되었습니다: DETAIL_BENCHMARK_URL');
+  return {
+    url: env.DETAIL_BENCHMARK_URL,
+    detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
+    detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS)
   };
 }
 
@@ -1286,6 +1300,63 @@ async function configureDetailResourcePolicy(context) {
   });
 }
 
+async function closePageSafely(page, timeoutMs = 2000) {
+  if (!page || page.isClosed()) return;
+  await Promise.race([
+    page.close({ runBeforeUnload: false }).catch(() => undefined),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs))
+  ]);
+}
+
+async function processDetailPage(page, url, config, logPrefix) {
+  const navigationTimeoutMs = config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS;
+  const readyTimeoutMs = config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS;
+  const hardTimeoutMs = config.detailHardTimeoutMs || DEFAULT_DETAIL_HARD_TIMEOUT_MS;
+  page.setDefaultNavigationTimeout(navigationTimeoutMs);
+  page.setDefaultTimeout(readyTimeoutMs);
+  log('INFO', `${logPrefix} timeout 설정: navigation=${navigationTimeoutMs}ms, ready=${readyTimeoutMs}ms, hard=${hardTimeoutMs}ms`);
+
+  let hardTimer;
+  const work = async () => {
+    log('INFO', `${logPrefix} goto 시작`);
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
+      log('INFO', `${logPrefix} goto 완료`);
+    } catch (error) {
+      log('WARN', `${logPrefix} goto 실패: ${error.name}: ${error.message} (설정 timeout=${navigationTimeoutMs}ms)`);
+      throw error;
+    }
+    log('INFO', `${logPrefix} ready 대기 시작`);
+    try {
+      await page.waitForFunction(() => {
+        const text = document.body?.innerText || '';
+        return (/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text) &&
+          /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text));
+      }, null, { timeout: readyTimeoutMs });
+      log('INFO', `${logPrefix} ready 완료`);
+    } catch (error) {
+      log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms)`);
+      throw error;
+    }
+    log('INFO', `${logPrefix} parse 시작`);
+    const product = await extractProductDetail(page, url);
+    log('INFO', `${logPrefix} parse 완료`);
+    return product;
+  };
+
+  const hardTimeout = new Promise((_, reject) => {
+    hardTimer = setTimeout(() => {
+      closePageSafely(page).catch(() => undefined);
+      reject(new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`));
+    }, hardTimeoutMs);
+  });
+  try {
+    return await Promise.race([work(), hardTimeout]);
+  } finally {
+    clearTimeout(hardTimer);
+  }
+}
+
 function parseProductText(title, text, rowTexts = []) {
   const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
   const name = clean(title).replace(/\s*[|–-]\s*Notion.*$/i, '');
@@ -1382,38 +1453,66 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     const detailConcurrency = Math.min(config.detailConcurrency || DEFAULT_DETAIL_CONCURRENCY, urls.length);
     const detailStartedAt = Date.now();
     const detailDurationsMs = [];
+    const reusePages = config.detailReusePages !== false;
     log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
     const detailContext = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
     await configureDetailResourcePolicy(detailContext);
     let cursor = 0;
-    const worker = async () => {
-      const page = await detailContext.newPage();
+    const worker = async (workerIndex) => {
+      const workerId = workerIndex + 1;
+      let page;
+      let pageGeneration = 0;
+      const createPage = async () => {
+        pageGeneration += 1;
+        page = await detailContext.newPage();
+        return page;
+      };
       try {
         while (cursor < urls.length) {
           const index = cursor++;
           const url = urls[index];
           const position = index + 1;
           const productStartedAt = Date.now();
-          log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url}`);
+          const hardTimeoutMs = config.detailHardTimeoutMs || DEFAULT_DETAIL_HARD_TIMEOUT_MS;
+          const deadline = productStartedAt + hardTimeoutMs;
+          log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url} (workerId=${workerId})`);
           let lastError;
           const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
           for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) {
+              lastError = new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`);
+              break;
+            }
+            if (!page || page.isClosed() || !reusePages) await createPage();
+            const logPrefix = `상세 페이지 조회 ${position}/${urls.length} [workerId=${workerId}, pageId=${pageGeneration}, attempt=${attempt}]`;
             try {
-              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS });
-              await page.waitForFunction(() => {
-                const text = document.body?.innerText || '';
-                return (/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text) &&
-                  /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text));
-              }, null, { timeout: config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS });
-              products[index] = await extractProductDetail(page, url);
+              products[index] = await processDetailPage(page, url, {
+                ...config,
+                detailHardTimeoutMs: Math.min(hardTimeoutMs, remainingMs)
+              }, logPrefix);
               lastError = null;
               const durationMs = Date.now() - productStartedAt;
               detailDurationsMs.push(durationMs);
               log('INFO', `상세 페이지 조회 ${position}/${urls.length} 완료: ${products[index].name} (${(durationMs / 1000).toFixed(1)}초)`);
+              if (reusePages) {
+                log('INFO', `${logPrefix} page cleanup 시작 (재사용)`);
+                await page.evaluate(() => window.stop()).catch(() => undefined);
+                log('INFO', `${logPrefix} page cleanup 완료 (재사용)`);
+              } else {
+                log('INFO', `${logPrefix} page cleanup 시작`);
+                await closePageSafely(page);
+                log('INFO', `${logPrefix} page cleanup 완료`);
+                page = null;
+              }
               break;
             } catch (error) {
               lastError = createPageFetchError(error);
-              if (attempt < maxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
+              log('INFO', `${logPrefix} page cleanup 시작`);
+              await closePageSafely(page, Math.max(0, Math.min(2000, deadline - Date.now())));
+              log('INFO', `${logPrefix} page cleanup 완료`);
+              page = null;
+              if (lastError.reason === 'detail hard timeout') break;
             }
           }
           if (lastError) {
@@ -1425,11 +1524,16 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
           }
         }
       } finally {
-        await page.close().catch(() => undefined);
+        if (page) {
+          const prefix = `workerId=${workerId}, pageId=${pageGeneration}`;
+          log('INFO', `${prefix} page cleanup 시작`);
+          await closePageSafely(page);
+          log('INFO', `${prefix} page cleanup 완료`);
+        }
       }
     };
     try {
-      await Promise.all(Array.from({ length: detailConcurrency }, worker));
+      await Promise.all(Array.from({ length: detailConcurrency }, (_, index) => worker(index)));
     } finally {
       await detailContext.close().catch(() => undefined);
     }
@@ -1442,6 +1546,48 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       throw error;
     }
     return validateCatalog(normalizeCatalog(products));
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+async function benchmarkDetailMode(browser, url, config, reusePage, count = 5) {
+  const context = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
+  await configureDetailResourcePolicy(context);
+  const durations = [];
+  let page;
+  try {
+    for (let index = 0; index < count; index += 1) {
+      if (!page || !reusePage) page = await context.newPage();
+      const startedAt = Date.now();
+      await processDetailPage(page, url, config, `벤치마크 ${reusePage ? '재사용' : '새 page'} ${index + 1}/${count}`);
+      durations.push(Date.now() - startedAt);
+      if (!reusePage) {
+        await closePageSafely(page);
+        page = null;
+      }
+    }
+  } finally {
+    if (page) await closePageSafely(page);
+    await context.close().catch(() => undefined);
+  }
+  return {
+    mode: reusePage ? 'reuse-page' : 'new-page-per-product',
+    count,
+    averageMs: durations.reduce((sum, value) => sum + value, 0) / durations.length,
+    maxMs: Math.max(...durations),
+    durationsMs: durations
+  };
+}
+
+async function benchmarkDetails(config = resolveDetailBenchmarkConfig()) {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch(getChromiumLaunchOptions());
+  try {
+    const reuse = await benchmarkDetailMode(browser, config.url, config, true, 5);
+    const fresh = await benchmarkDetailMode(browser, config.url, config, false, 5);
+    log('INFO', `상세 벤치마크 결과: ${JSON.stringify({ reuse, fresh })}`);
+    return { reuse, fresh };
   } finally {
     await browser.close().catch(() => undefined);
   }
@@ -1613,7 +1759,12 @@ async function saveStateWithLog(stateFile, state) {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--debug-cards')) {
+  if (process.argv.includes('--benchmark-details')) {
+    benchmarkDetails().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--debug-cards')) {
     debugCards().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -1628,6 +1779,7 @@ if (require.main === module) {
 module.exports = {
   resolveConfig,
   resolveDebugConfig,
+  resolveDetailBenchmarkConfig,
   acquireLock,
   releaseLock,
   readState,
@@ -1659,8 +1811,12 @@ module.exports = {
   parseProductText,
   shouldAbortDetailResource,
   configureDetailResourcePolicy,
+  closePageSafely,
+  processDetailPage,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
+  benchmarkDetailMode,
+  benchmarkDetails,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
@@ -1674,6 +1830,7 @@ module.exports = {
   DEFAULT_DETAIL_CONCURRENCY,
   DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS,
   DEFAULT_DETAIL_READY_TIMEOUT_MS,
+  DEFAULT_DETAIL_HARD_TIMEOUT_MS,
   MIN_PRODUCT_COUNT,
   DEFAULT_STALE_LOCK_MS,
   DEFAULT_PAGE_LOAD_TIMEOUT_MS,

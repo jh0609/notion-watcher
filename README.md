@@ -58,6 +58,8 @@ SNAPSHOT_DIR=./snapshots
 DETAIL_CONCURRENCY=2
 DETAIL_NAVIGATION_TIMEOUT_MS=20000
 DETAIL_READY_TIMEOUT_MS=10000
+DETAIL_HARD_TIMEOUT_MS=35000
+DETAIL_REUSE_PAGES=true
 DEBUG_DOM=false
 DEBUG_DIR=./debug
 DEBUG_SAVE_SCREENSHOTS=false
@@ -75,7 +77,7 @@ OPERATOR_NTFY_TOPIC=
 
 `SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 기본값은 `2`입니다.
 
-상세 조회는 하나의 전용 BrowserContext를 공유하고 worker별 page를 재사용합니다. `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 허용합니다. Service Worker는 차단됩니다. `DETAIL_NAVIGATION_TIMEOUT_MS` 기본값은 `20000`, 가격과 판매 상태가 나타날 때까지 기다리는 `DETAIL_READY_TIMEOUT_MS` 기본값은 `10000`입니다.
+상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 허용합니다. Service Worker는 차단됩니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 가격과 판매 상태 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 
@@ -93,6 +95,14 @@ npm run debug:cards
 ```
 
 수동 진단 모드는 항상 DOM 진단 파일을 저장하며 카탈로그 상태나 알림 상태는 변경하지 않습니다.
+
+동일한 상세 URL을 page 재사용/상품별 새 page 방식으로 각각 5회 비교하려면 실행합니다.
+
+```bash
+DETAIL_BENCHMARK_URL=https://example.notion.site/<page-id> npm run benchmark:details
+```
+
+각 방식의 개별 시간, 평균 및 최댓값이 로그에 출력됩니다.
 
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 

@@ -8,7 +8,8 @@ const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards,
-  attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy, runOnce
+  attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
+  processDetailPage, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -178,6 +179,32 @@ test('리소스 차단 적용 전후의 텍스트 본문 파싱 결과는 동일
   assert.deepEqual(afterBlocking, beforeBlocking);
   assert.equal(afterBlocking.price, '19,000원');
   assert.equal(afterBlocking.status, '판매 중');
+});
+
+test('20초 navigation timeout은 page.goto에 직접 적용되어 20~25초 안에 반환된다', { timeout: 30_000 }, async () => {
+  let passedOptions;
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    isClosed: () => false,
+    close: async () => undefined,
+    goto: async (_url, options) => {
+      passedOptions = options;
+      await new Promise((resolve) => setTimeout(resolve, options.timeout));
+      const error = new Error(`Timeout ${options.timeout}ms exceeded`);
+      error.name = 'TimeoutError';
+      throw error;
+    }
+  };
+  const startedAt = Date.now();
+  await assert.rejects(processDetailPage(page, 'https://example.test/product', {
+    detailNavigationTimeoutMs: 20_000,
+    detailReadyTimeoutMs: 10_000,
+    detailHardTimeoutMs: 35_000
+  }, 'timeout-test'), /Timeout 20000ms/);
+  const elapsedMs = Date.now() - startedAt;
+  assert.deepEqual(passedOptions, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+  assert.ok(elapsedMs >= 19_500 && elapsedMs <= 25_000, `elapsed=${elapsedMs}ms`);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {
