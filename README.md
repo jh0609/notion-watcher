@@ -15,7 +15,9 @@
 
 URL 후보는 메인 페이지와 같은 호스트 또는 `notion.so`/`notion.site` 내부 페이지만 허용합니다. X, Twitter, Instagram, YouTube, Facebook과 기타 외부 호스트, `mailto:`, `tel:`, `javascript:`, 해시 링크 및 메인 페이지 자체는 제외합니다. 각 후보의 링크 문구, 호스트, 판정과 제외 사유는 `DEBUG product-url-candidate` JSON 로그로 출력됩니다. 갤러리 카드에 `href`가 없으면 `role=link`, `data-page-id`, `data-block-id` 카드 구조와 클릭 후 이동 URL을 확인합니다.
 
-카드 후보는 갤러리/데이터베이스 구조, 가격·판매 상태 문구, 클릭 가능한 스타일이나 역할, Notion ID 속성, 이미지와 텍스트 조합을 점수화해 선정합니다. 각 후보를 실제로 클릭한 뒤 현재 URL과 history 변경, popup, peek/modal, modal 내부 링크 및 `Open as page`/`전체 페이지로 열기` 동작을 조사합니다. 후보별 실패는 다음 후보 조사를 막지 않으며 `card-click-result` DEBUG JSON 로그에 남습니다.
+카드 후보는 갤러리/데이터베이스 구조, 가격·판매 상태 문구, 클릭 가능한 스타일이나 역할, Notion ID 속성, 이미지와 텍스트 조합을 점수화해 선정합니다. 운영 모드는 카드 내부 `a[href]`의 32자리 page UUID를 먼저 사용하고, 없으면 카드의 `data-block-id`를 사용합니다. 두 방식으로 URL을 얻지 못한 카드만 클릭 fallback으로 조사합니다. 운영 모드에서는 modal HTML, 스크린샷, 클릭 진단 결과 파일을 저장하지 않습니다.
+
+수동 `debug:cards` 모드는 각 후보를 실제로 클릭한 뒤 현재 URL과 history 변경, popup, peek/modal, modal 내부 링크를 조사합니다. 후보별 실패는 다음 후보 조사를 막지 않으며 `card-click-results.json`에 남습니다.
 
 상품이 2개 미만이거나 외부 서비스 제목이 감지되거나 상세 페이지 하나라도 실패하면 최초 실행을 포함해 카탈로그 상태를 저장하지 않습니다.
 

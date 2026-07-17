@@ -849,6 +849,18 @@ function canonicalizeNotionProductUrl(value, mainUrl) {
   return `${main.origin}/${pageId}`;
 }
 
+function resolveCardProductUrl(candidate, mainUrl) {
+  for (const href of candidate?.hrefs || []) {
+    const url = canonicalizeNotionProductUrl(href, mainUrl);
+    if (url && extractNotionPageId(url, mainUrl)) return { url, source: 'card-anchor' };
+  }
+  const blockId = `${candidate?.blockId || ''}`;
+  if (/^(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(blockId)) {
+    return { url: new URL(`/${blockId.replace(/-/g, '').toLowerCase()}`, mainUrl).href, source: 'card-block-id' };
+  }
+  return null;
+}
+
 function evaluateProductUrlCandidate(candidate, mainUrl) {
   const href = normalizeValue(candidate?.href);
   const innerText = normalizeValue(candidate?.innerText);
@@ -966,6 +978,7 @@ function diffCatalog(previousCatalog, currentCatalog) {
 async function collectProductUrls(page, mainUrl) {
   const config = arguments[2] || {};
   const debugDir = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR);
+  const clickDiagnosticMode = Boolean(config.diagnosticMode);
   if (config.debugDom) {
     await fs.mkdir(debugDir, { recursive: true });
     const oldDebugFiles = await fs.readdir(debugDir).catch(() => []);
@@ -973,7 +986,7 @@ async function collectProductUrls(page, mainUrl) {
       /^(?:main-page\.(?:html|png)|card-(?:candidates|click-results)\.json|modal-\d+\.(?:html|png))$/.test(name)
     ).map((name) => fs.unlink(path.join(debugDir, name)).catch(() => undefined)));
     await fs.writeFile(path.join(debugDir, 'main-page.html'), await page.content(), 'utf8');
-    if (config.debugSaveScreenshots) {
+    if (clickDiagnosticMode && config.debugSaveScreenshots) {
       await saveDebugScreenshot(
         () => page.screenshot({ path: path.join(debugDir, 'main-page.png'), fullPage: true }),
         'main-page'
@@ -1030,6 +1043,10 @@ async function collectProductUrls(page, mainUrl) {
         blockId: item.element.getAttribute('data-block-id') || '',
         pageId: item.element.getAttribute('data-page-id') || '',
         pageUrl: location.href,
+        hrefs: [...new Set([
+          item.element.getAttribute('href') || '',
+          ...[...item.element.querySelectorAll('a[href]')].map((anchor) => anchor.getAttribute('href') || '')
+        ].filter(Boolean))],
         hasImage: item.hasImage,
         hasProductText: item.hasProductText,
         clickable: item.clickable,
@@ -1040,7 +1057,7 @@ async function collectProductUrls(page, mainUrl) {
 
   if (config.debugDom) await saveStateAtomic(path.join(debugDir, 'card-candidates.json'), candidates);
   if (!candidates.length) {
-    if (config.debugDom) await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), []);
+    if (clickDiagnosticMode) await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), []);
     throw new PageFetchError('product card candidates not found');
   }
 
@@ -1059,10 +1076,23 @@ async function collectProductUrls(page, mainUrl) {
     let popup = null;
     try {
       const beforeUrl = canonicalizeUrl(page.url(), mainUrl);
-      if (candidate.blockId) result.detected.push({
-        source: 'card-block-id',
-        href: new URL(`/${candidate.blockId.replace(/-/g, '')}`, mainUrl).href
-      });
+      const directUrl = resolveCardProductUrl(candidate, mainUrl);
+      if (directUrl) result.detected.push({ source: directUrl.source, href: directUrl.url });
+
+      if (result.detected.length) {
+        for (const detected of result.detected) {
+          const diagnostic = evaluateProductUrlCandidate({ href: detected.href, innerText: candidate.innerText }, mainUrl);
+          diagnostics.push({ ...diagnostic, candidateId: candidate.id, source: detected.source });
+          if (diagnostic.allowed) {
+            const stableUrl = canonicalizeNotionProductUrl(diagnostic.href, mainUrl);
+            const key = extractNotionPageId(stableUrl, mainUrl) || stableUrl;
+            if (stableUrl && !urls.has(key)) urls.set(key, stableUrl);
+          }
+        }
+        result.success = true;
+        if (!clickDiagnosticMode) continue;
+      }
+
       const popupPromise = page.context().waitForEvent('page', { timeout: 700 }).catch(() => null);
       await page.evaluate((item) => {
         const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
@@ -1099,7 +1129,7 @@ async function collectProductUrls(page, mainUrl) {
           }))
         }));
         modalData.links.forEach((link) => result.detected.push({ source: 'modal-link', ...link }));
-        if (config.debugDom) {
+        if (clickDiagnosticMode) {
           await fs.writeFile(path.join(debugDir, `modal-${modalNumber}.html`), modalData.html, 'utf8');
           if (config.debugSaveScreenshots) {
             await saveDebugScreenshot(async () => {
@@ -1154,13 +1184,15 @@ async function collectProductUrls(page, mainUrl) {
         await page.goto(mainUrl, { waitUntil: 'domcontentloaded' }).catch(() => null);
       }
       clickResults.push(result);
-      if (config.debugDom) await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), clickResults);
+      if (clickDiagnosticMode) await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), clickResults);
     }
   }
 
   diagnostics.forEach((item) => log('DEBUG', `product-url-candidate ${JSON.stringify(item)}`));
-  clickResults.forEach((item) => log('DEBUG', `card-click-result ${JSON.stringify(item)}`));
-  if (config.debugDom) await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), clickResults);
+  if (clickDiagnosticMode) {
+    clickResults.forEach((item) => log('DEBUG', `card-click-result ${JSON.stringify(item)}`));
+    await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), clickResults);
+  }
   if (!urls.size) throw new PageFetchError('product detail URLs not found');
   return { urls: [...urls.values()], diagnostics, candidates, clickResults };
 }
@@ -1255,7 +1287,11 @@ async function debugCards(config = resolveDebugConfig()) {
     await page.goto(config.notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
     await page.waitForTimeout(config.collectionWaitMs).catch(() => null);
     await page.waitForTimeout(config.extraWaitMs);
-    const result = await collectProductUrls(page, config.notionPageUrl, { ...config, debugDom: true });
+    const result = await collectProductUrls(page, config.notionPageUrl, {
+      ...config,
+      debugDom: true,
+      diagnosticMode: true
+    });
     log('INFO', `카드 ${result.candidates.length}개를 조사해 상품 상세 URL ${result.urls.length}개를 찾았습니다.`);
     result.urls.forEach((url) => log('INFO', url));
     return result;
@@ -1435,6 +1471,7 @@ module.exports = {
   canonicalizeUrl,
   extractNotionPageId,
   canonicalizeNotionProductUrl,
+  resolveCardProductUrl,
   evaluateProductUrlCandidate,
   validateCatalog,
   normalizeProduct,

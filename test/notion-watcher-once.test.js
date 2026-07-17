@@ -7,7 +7,7 @@ const path = require('path');
 const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
-  canonicalizeNotionProductUrl, resolveDebugConfig, runOnce
+  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -96,6 +96,21 @@ test('peek, modal, block-id URL을 같은 Notion 상품 URL로 정규화한다',
   assert.deepEqual([...new Set(variants.map((url) => canonicalizeNotionProductUrl(url, main)))], [
     `https://shop.notion.site/${id}`
   ]);
+});
+
+test('카드 URL은 내부 href를 우선하고 없으면 data-block-id를 사용한다', () => {
+  const main = 'https://shop.notion.site/catalog-3973f4a9f62680f39ddafca527725466';
+  const hrefId = '5273f4a9f62683e5b87581c092c3aff2';
+  const blockId = 'fc23f4a9-f626-8239-b103-019493706226';
+  assert.deepEqual(resolveCardProductUrl({ hrefs: [`/${hrefId}?pvs=25`], blockId }, main), {
+    url: `https://shop.notion.site/${hrefId}`,
+    source: 'card-anchor'
+  });
+  assert.deepEqual(resolveCardProductUrl({ hrefs: [], blockId }, main), {
+    url: 'https://shop.notion.site/fc23f4a9f6268239b103019493706226',
+    source: 'card-block-id'
+  });
+  assert.equal(resolveCardProductUrl({ hrefs: ['https://x.com/example'], blockId: '' }, main), null);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {
