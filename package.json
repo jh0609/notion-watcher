@@ -8,6 +8,7 @@
     "start": "node notion-watcher-once.js",
     "debug:cards": "node notion-watcher-once.js --debug-cards",
     "benchmark:details": "node notion-watcher-once.js --benchmark-details",
+    "debug:detail": "node notion-watcher-once.js --debug-detail",
     "check": "node --check notion-watcher-once.js",
     "test": "node --test"
   },

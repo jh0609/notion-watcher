@@ -193,6 +193,17 @@ function resolveDetailBenchmarkConfig(env = process.env) {
   };
 }
 
+function resolveSingleDetailConfig(env = process.env) {
+  const url = env.DETAIL_DIAGNOSTIC_URL || env.DETAIL_BENCHMARK_URL;
+  if (!url) throw new Error('필수 환경변수가 누락되었습니다: DETAIL_DIAGNOSTIC_URL');
+  return {
+    url,
+    detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
+    detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
+    detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS)
+  };
+}
+
 async function saveDebugScreenshot(action, label) {
   try {
     await action();
@@ -1308,6 +1319,29 @@ async function closePageSafely(page, timeoutMs = 2000) {
   ]);
 }
 
+function createDetailPageSlot(context) {
+  let page = null;
+  let generation = 0;
+  return {
+    async get(forceNew = false) {
+      if (forceNew && page) await this.discard();
+      if (!page || page.isClosed()) {
+        page = await context.newPage();
+        generation += 1;
+      }
+      return { page, generation };
+    },
+    async discard(timeoutMs = 2000) {
+      const oldPage = page;
+      page = null;
+      if (oldPage) await closePageSafely(oldPage, timeoutMs);
+    },
+    current() {
+      return { page, generation };
+    }
+  };
+}
+
 async function processDetailPage(page, url, config, logPrefix) {
   const navigationTimeoutMs = config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS;
   const readyTimeoutMs = config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS;
@@ -1316,42 +1350,89 @@ async function processDetailPage(page, url, config, logPrefix) {
   page.setDefaultTimeout(readyTimeoutMs);
   log('INFO', `${logPrefix} timeout 설정: navigation=${navigationTimeoutMs}ms, ready=${readyTimeoutMs}ms, hard=${hardTimeoutMs}ms`);
 
+  const expectedPageId = extractNotionPageId(url, url);
+  const attemptState = { cancelled: false };
   let hardTimer;
   const work = async () => {
-    log('INFO', `${logPrefix} goto 시작`);
+    if (!attemptState.cancelled) log('INFO', `${logPrefix} goto 시작`);
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
-      log('INFO', `${logPrefix} goto 완료`);
+      if (!attemptState.cancelled) log('INFO', `${logPrefix} goto 완료`);
     } catch (error) {
-      log('WARN', `${logPrefix} goto 실패: ${error.name}: ${error.message} (설정 timeout=${navigationTimeoutMs}ms)`);
+      if (!attemptState.cancelled) log('WARN', `${logPrefix} goto 실패: ${error.name}: ${error.message} (설정 timeout=${navigationTimeoutMs}ms)`);
       throw error;
     }
-    log('INFO', `${logPrefix} ready 대기 시작`);
+    const readyStartedAt = Date.now();
+    if (!attemptState.cancelled) log('INFO', `${logPrefix} ready 대기 시작`);
     try {
-      await page.waitForFunction(() => {
+      await page.waitForFunction(({ expectedPageId: pageId }) => {
         const text = document.body?.innerText || '';
-        return (/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text) &&
-          /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text));
-      }, null, { timeout: readyTimeoutMs });
-      log('INFO', `${logPrefix} ready 완료`);
+        const compactUrl = location.href.replace(/-/g, '').toLowerCase();
+        return document.readyState !== 'loading' && text.trim().length >= 20 && (!pageId || compactUrl.includes(pageId));
+      }, { expectedPageId }, { timeout: readyTimeoutMs });
+      if (!attemptState.cancelled) log('INFO', `${logPrefix} ready 완료 (${Date.now() - readyStartedAt}ms)`);
     } catch (error) {
-      log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms)`);
+      if (!attemptState.cancelled) {
+        const diagnostic = await page.evaluate((pageId) => {
+          const text = document.body?.innerText || '';
+          const compactUrl = location.href.replace(/-/g, '').toLowerCase();
+          return {
+            currentUrl: location.href,
+            documentReadyState: document.readyState,
+            bodyTextLength: text.length,
+            bodyTextPreview: text.slice(0, 1000),
+            priceMatched: /\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/.test(text),
+            statusMatched: /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i.test(text),
+            expectedPageId: pageId,
+            expectedPageIdMatched: !pageId || compactUrl.includes(pageId)
+          };
+        }, expectedPageId).catch(() => ({ diagnosticUnavailable: true }));
+        log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
+        log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
+      }
       throw error;
     }
-    log('INFO', `${logPrefix} parse 시작`);
-    const product = await extractProductDetail(page, url);
-    log('INFO', `${logPrefix} parse 완료`);
-    return product;
+    if (!attemptState.cancelled) log('INFO', `${logPrefix} parse 시작`);
+    try {
+      const product = await extractProductDetail(page, url);
+      if (!attemptState.cancelled) log('INFO', `${logPrefix} parse 완료`);
+      return product;
+    } catch (error) {
+      const incomplete = /product (?:name|price|status) not found/i.test(error.message || '');
+      if (!incomplete) {
+        if (!attemptState.cancelled) log('WARN', `${logPrefix} parse 실패: ${error.name}: ${error.message}`);
+        throw error;
+      }
+      if (!attemptState.cancelled) log('WARN', `${logPrefix} parse 불완전, 1초 후 재파싱: ${error.message}`);
+      await page.waitForTimeout(1000);
+      try {
+        const product = await extractProductDetail(page, url);
+        if (!attemptState.cancelled) log('INFO', `${logPrefix} parse 재시도 완료`);
+        return product;
+      } catch (retryError) {
+        if (!attemptState.cancelled) log('WARN', `${logPrefix} parse 실패: ${retryError.name}: ${retryError.message}`);
+        throw retryError;
+      }
+    }
   };
 
-  const hardTimeout = new Promise((_, reject) => {
-    hardTimer = setTimeout(() => {
-      closePageSafely(page).catch(() => undefined);
-      reject(new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`));
+  const settledWork = work().then(
+    (value) => ({ kind: 'work', value }),
+    (error) => ({ kind: 'error', error })
+  );
+  const hardTimeout = new Promise((resolve) => {
+    hardTimer = setTimeout(async () => {
+      attemptState.cancelled = true;
+      await closePageSafely(page, 1000);
+      resolve({ kind: 'hard-timeout' });
     }, hardTimeoutMs);
   });
   try {
-    return await Promise.race([work(), hardTimeout]);
+    const result = await Promise.race([settledWork, hardTimeout]);
+    if (result.kind === 'work') return result.value;
+    if (result.kind === 'error') throw result.error;
+    await settledWork;
+    throw new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`);
   } finally {
     clearTimeout(hardTimer);
   }
@@ -1388,6 +1469,8 @@ async function extractProductDetail(page, url) {
   const raw = parseProductText(source.title, source.text, source.rowTexts);
   assertNotionContentLooksUsable({ url: page.url(), title: raw.name, text: raw.text, renderedCandidateCount: 1 });
   if (!raw.name) throw new PageFetchError('product name not found');
+  if (!raw.price) throw new PageFetchError('product price not found');
+  if (!raw.status) throw new PageFetchError('product status not found');
   if (EXTERNAL_SERVICE_TITLE_PATTERNS.some((pattern) => pattern.test(raw.name))) {
     throw new PageFetchError('external service title detected', raw.name);
   }
@@ -1460,13 +1543,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     let cursor = 0;
     const worker = async (workerIndex) => {
       const workerId = workerIndex + 1;
-      let page;
-      let pageGeneration = 0;
-      const createPage = async () => {
-        pageGeneration += 1;
-        page = await detailContext.newPage();
-        return page;
-      };
+      const pageSlot = createDetailPageSlot(detailContext);
       try {
         while (cursor < urls.length) {
           const index = cursor++;
@@ -1484,7 +1561,9 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               lastError = new PageFetchError('detail hard timeout', `${hardTimeoutMs}ms`);
               break;
             }
-            if (!page || page.isClosed() || !reusePages) await createPage();
+            const allocated = await pageSlot.get(!reusePages);
+            const page = allocated.page;
+            const pageGeneration = allocated.generation;
             const logPrefix = `상세 페이지 조회 ${position}/${urls.length} [workerId=${workerId}, pageId=${pageGeneration}, attempt=${attempt}]`;
             try {
               products[index] = await processDetailPage(page, url, {
@@ -1501,17 +1580,15 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
                 log('INFO', `${logPrefix} page cleanup 완료 (재사용)`);
               } else {
                 log('INFO', `${logPrefix} page cleanup 시작`);
-                await closePageSafely(page);
+                await pageSlot.discard();
                 log('INFO', `${logPrefix} page cleanup 완료`);
-                page = null;
               }
               break;
             } catch (error) {
               lastError = createPageFetchError(error);
               log('INFO', `${logPrefix} page cleanup 시작`);
-              await closePageSafely(page, Math.max(0, Math.min(2000, deadline - Date.now())));
+              await pageSlot.discard(Math.max(0, Math.min(2000, deadline - Date.now())));
               log('INFO', `${logPrefix} page cleanup 완료`);
-              page = null;
               if (lastError.reason === 'detail hard timeout') break;
             }
           }
@@ -1524,10 +1601,11 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
           }
         }
       } finally {
-        if (page) {
-          const prefix = `workerId=${workerId}, pageId=${pageGeneration}`;
+        const currentPage = pageSlot.current();
+        if (currentPage.page) {
+          const prefix = `workerId=${workerId}, pageId=${currentPage.generation}`;
           log('INFO', `${prefix} page cleanup 시작`);
-          await closePageSafely(page);
+          await pageSlot.discard();
           log('INFO', `${prefix} page cleanup 완료`);
         }
       }
@@ -1588,6 +1666,27 @@ async function benchmarkDetails(config = resolveDetailBenchmarkConfig()) {
     const fresh = await benchmarkDetailMode(browser, config.url, config, false, 5);
     log('INFO', `상세 벤치마크 결과: ${JSON.stringify({ reuse, fresh })}`);
     return { reuse, fresh };
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch(getChromiumLaunchOptions());
+  try {
+    const context = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
+    await configureDetailResourcePolicy(context);
+    const page = await context.newPage();
+    try {
+      const startedAt = Date.now();
+      const product = await processDetailPage(page, config.url, config, '단일 상세 진단 [workerId=1, pageId=1]');
+      log('INFO', `단일 상세 진단 완료: ${product.name} (${((Date.now() - startedAt) / 1000).toFixed(1)}초)`);
+      return product;
+    } finally {
+      await closePageSafely(page);
+      await context.close().catch(() => undefined);
+    }
   } finally {
     await browser.close().catch(() => undefined);
   }
@@ -1759,7 +1858,12 @@ async function saveStateWithLog(stateFile, state) {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--benchmark-details')) {
+  if (process.argv.includes('--debug-detail')) {
+    diagnoseSingleDetail().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--benchmark-details')) {
     benchmarkDetails().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -1780,6 +1884,7 @@ module.exports = {
   resolveConfig,
   resolveDebugConfig,
   resolveDetailBenchmarkConfig,
+  resolveSingleDetailConfig,
   acquireLock,
   releaseLock,
   readState,
@@ -1812,11 +1917,13 @@ module.exports = {
   shouldAbortDetailResource,
   configureDetailResourcePolicy,
   closePageSafely,
+  createDetailPageSlot,
   processDetailPage,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
   benchmarkDetailMode,
   benchmarkDetails,
+  diagnoseSingleDetail,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,

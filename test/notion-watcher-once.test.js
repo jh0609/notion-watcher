@@ -9,7 +9,7 @@ const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards,
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
-  processDetailPage, runOnce
+  processDetailPage, createDetailPageSlot, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -205,6 +205,154 @@ test('20초 navigation timeout은 page.goto에 직접 적용되어 20~25초 안�
   const elapsedMs = Date.now() - startedAt;
   assert.deepEqual(passedOptions, { waitUntil: 'domcontentloaded', timeout: 20_000 });
   assert.ok(elapsedMs >= 19_500 && elapsedMs <= 25_000, `elapsed=${elapsedMs}ms`);
+});
+
+test('10초 ready timeout은 세 번째 인수로 전달되어 약 10초 안에 반환된다', { timeout: 15_000 }, async () => {
+  let receivedArgument;
+  let receivedOptions;
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    isClosed: () => false,
+    close: async () => undefined,
+    goto: async () => undefined,
+    waitForFunction: async (_fn, argument, options) => {
+      receivedArgument = argument;
+      receivedOptions = options;
+      await new Promise((resolve) => setTimeout(resolve, options.timeout));
+      const error = new Error(`Timeout ${options.timeout}ms exceeded`);
+      error.name = 'TimeoutError';
+      throw error;
+    },
+    evaluate: async () => ({ bodyTextLength: 20, priceMatched: false, statusMatched: false })
+  };
+  const startedAt = Date.now();
+  await assert.rejects(processDetailPage(page, 'https://example.test/5273f4a9f62683e5b87581c092c3aff2', {
+    detailNavigationTimeoutMs: 20_000,
+    detailReadyTimeoutMs: 10_000,
+    detailHardTimeoutMs: 35_000
+  }, 'ready-timeout-test'), /Timeout 10000ms/);
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(receivedArgument.expectedPageId, '5273f4a9f62683e5b87581c092c3aff2');
+  assert.deepEqual(receivedOptions, { timeout: 10_000 });
+  assert.ok(elapsedMs >= 9_500 && elapsedMs <= 13_000, `elapsed=${elapsedMs}ms`);
+});
+
+test('가격과 상태가 없어도 UUID, readyState, 본문 20자로 ready 조건을 통과한다', async () => {
+  let readyFunctionSource = '';
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    goto: async () => undefined,
+    waitForFunction: async (fn, argument, options) => {
+      readyFunctionSource = fn.toString();
+      assert.equal(argument.expectedPageId, '5273f4a9f62683e5b87581c092c3aff2');
+      assert.deepEqual(options, { timeout: 10_000 });
+    },
+    evaluate: async () => ({
+      title: '상품 A', text: '가격 상태 없이도 충분히 유의미한 상세 본문이 렌더링되어 있습니다.', rowTexts: []
+    }),
+    url: () => 'https://example.test/5273f4a9f62683e5b87581c092c3aff2',
+    waitForTimeout: async () => undefined,
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  await assert.rejects(processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 20_000, detailReadyTimeoutMs: 10_000, detailHardTimeoutMs: 35_000
+  }, 'ready-condition-test'), /product price not found/);
+  assert.match(readyFunctionSource, /readyState !== 'loading'/);
+  assert.match(readyFunctionSource, /length >= 20/);
+  assert.doesNotMatch(readyFunctionSource, /판매|SOLD|원/);
+});
+
+test('parse 결과가 불완전하면 1초 대기 후 한 번 재파싱한다', async () => {
+  let evaluateCalls = 0;
+  const waits = [];
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    goto: async () => undefined,
+    waitForFunction: async () => undefined,
+    evaluate: async () => {
+      evaluateCalls += 1;
+      return evaluateCalls === 1
+        ? { title: '상품 A', text: '상세 본문만 먼저 표시되었습니다.', rowTexts: [] }
+        : { title: '상품 A', text: '상품 A 10,000원 판매 중 (FOR SALE)', rowTexts: [] };
+    },
+    url: () => 'https://example.test/5273f4a9f62683e5b87581c092c3aff2',
+    waitForTimeout: async (ms) => waits.push(ms),
+    isClosed: () => false,
+    close: async () => undefined
+  };
+  const result = await processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 20_000, detailReadyTimeoutMs: 10_000, detailHardTimeoutMs: 35_000
+  }, 'parse-retry-test');
+  assert.equal(result.price, '10,000원');
+  assert.deepEqual(waits, [1000]);
+  assert.equal(evaluateCalls, 2);
+});
+
+test('hard timeout은 page를 닫고 이전 attempt가 정착한 뒤 반환한다', async () => {
+  let closed = false;
+  let underlyingSettled = false;
+  const page = {
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    isClosed: () => closed,
+    close: async () => { closed = true; },
+    goto: async () => undefined,
+    waitForFunction: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      underlyingSettled = true;
+      throw new Error('late ready failure');
+    }
+  };
+  const originalLog = console.log;
+  const captured = [];
+  console.log = (...args) => captured.push(args.join(' '));
+  try {
+    await assert.rejects(processDetailPage(page, 'https://example.test/5273f4a9f62683e5b87581c092c3aff2', {
+      detailNavigationTimeoutMs: 1000,
+      detailReadyTimeoutMs: 1000,
+      detailHardTimeoutMs: 20
+    }, 'hard-timeout-test'), /detail hard timeout/);
+    assert.equal(closed, true);
+    assert.equal(underlyingSettled, true);
+    const countAtReturn = captured.length;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(captured.length, countAtReturn);
+    assert.equal(captured.some((line) => /late ready failure|Target page.*closed/i.test(line)), false);
+  } finally {
+    console.log = originalLog;
+  }
+});
+
+test('worker 두 개가 page를 교체해도 활성 page 수는 동시성 2를 넘지 않는다', async () => {
+  let active = 0;
+  let maxActive = 0;
+  const context = {
+    newPage: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      let closed = false;
+      return {
+        isClosed: () => closed,
+        close: async () => {
+          if (!closed) {
+            closed = true;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            active -= 1;
+          }
+        }
+      };
+    }
+  };
+  const slots = [createDetailPageSlot(context), createDetailPageSlot(context)];
+  await Promise.all(slots.map((slot) => slot.get()));
+  await Promise.all(slots.map((slot) => slot.get(true)));
+  assert.equal(maxActive, 2);
+  await Promise.all(slots.map((slot) => slot.discard()));
+  assert.equal(active, 0);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {

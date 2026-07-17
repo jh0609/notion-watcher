@@ -104,6 +104,12 @@ DETAIL_BENCHMARK_URL=https://example.notion.site/<page-id> npm run benchmark:det
 
 각 방식의 개별 시간, 평균 및 최댓값이 로그에 출력됩니다.
 
+운영과 동일한 goto/ready/parse 경로로 상세 URL 하나만 진단할 수 있습니다. 먼저 `DETAIL_CONCURRENCY=1`로 검증한 뒤 정상 동작하면 `2`로 올리는 것을 권장합니다.
+
+```bash
+DETAIL_DIAGNOSTIC_URL=https://example.notion.site/<page-id> npm run debug:detail
+```
+
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 
 - `PAGE_LOAD_TIMEOUT_MS`: 각 페이지 조회 시도의 첫 응답 대기 시간, 기본 `60000`
