@@ -10,7 +10,8 @@ const DEFAULT_STATE_FILE = './notion-watcher-state.json';
 const DEFAULT_LOCK_FILE = './notion-watcher.lock';
 const DEFAULT_OPERATION_STATE_FILE = './notion-watcher-operation-state.json';
 const DEFAULT_MIN_TEXT_LENGTH = 50;
-const DEFAULT_MAX_TEXT_CHANGE_RATIO = 0.7;
+const DEFAULT_SNAPSHOT_DIR = './snapshots';
+const DEFAULT_DETAIL_CONCURRENCY = 2;
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_DOMCONTENTLOADED_TIMEOUT_MS = 15 * 1000;
@@ -83,7 +84,6 @@ function resolveConfig(env = process.env) {
   }
 
   const minTextLength = Number.parseInt(env.MIN_TEXT_LENGTH || `${DEFAULT_MIN_TEXT_LENGTH}`, 10);
-  const maxTextChangeRatio = Number.parseFloat(env.MAX_TEXT_CHANGE_RATIO || `${DEFAULT_MAX_TEXT_CHANGE_RATIO}`);
   const staleLockMs = Number.parseInt(env.STALE_LOCK_MS || `${DEFAULT_STALE_LOCK_MS}`, 10);
   const pageLoadTimeoutMs = parsePositiveIntegerEnv(
     { PAGE_LOAD_TIMEOUT_MS: env.PAGE_LOAD_TIMEOUT_MS || env.PAGE_TIMEOUT_MS },
@@ -107,13 +107,12 @@ function resolveConfig(env = process.env) {
     env.PAGE_FETCH_RETRY_DELAYS_MS,
     DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS
   );
+  const detailConcurrency = parsePositiveIntegerEnv(env, 'DETAIL_CONCURRENCY', DEFAULT_DETAIL_CONCURRENCY);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
   }
-  if (!Number.isFinite(maxTextChangeRatio) || maxTextChangeRatio <= 0 || maxTextChangeRatio >= 1) {
-    throw new Error('MAX_TEXT_CHANGE_RATIO는 0보다 크고 1보다 작은 숫자여야 합니다.');
-  }
+  if (detailConcurrency > 2) throw new Error('DETAIL_CONCURRENCY는 1 또는 2여야 합니다.');
   if (!Number.isFinite(staleLockMs) || staleLockMs < 1) {
     throw new Error('STALE_LOCK_MS는 1 이상의 숫자여야 합니다.');
   }
@@ -128,7 +127,8 @@ function resolveConfig(env = process.env) {
     operationStateFile: env.OPERATION_STATE_FILE || DEFAULT_OPERATION_STATE_FILE,
     lockFile: env.LOCK_FILE || DEFAULT_LOCK_FILE,
     minTextLength,
-    maxTextChangeRatio,
+    snapshotDir: env.SNAPSHOT_DIR || DEFAULT_SNAPSHOT_DIR,
+    detailConcurrency,
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -574,28 +574,18 @@ function getPreviousTableText(previousState) {
   return '';
 }
 
-function isSuspiciousTextSizeChange(previousText, currentText, maxTextChangeRatio = DEFAULT_MAX_TEXT_CHANGE_RATIO) {
-  if (!previousText || !currentText) return false;
-  const previousLength = previousText.length;
-  const currentLength = currentText.length;
-  if (previousLength < DEFAULT_MIN_TEXT_LENGTH || currentLength < DEFAULT_MIN_TEXT_LENGTH) return false;
-  const larger = Math.max(previousLength, currentLength);
-  const smaller = Math.min(previousLength, currentLength);
-  return (larger - smaller) / larger > maxTextChangeRatio;
-}
-
-async function sendNtfyNotification(config, checkedAt, previousTextLength, currentTextLength, tableDiff = '') {
+async function sendNtfyNotification(config, checkedAt, previousProductCount, currentProductCount, catalogDiff = '') {
   const url = `${config.ntfyServerUrl}/${encodeURIComponent(config.ntfyTopic)}`;
   const checkedAtText = formatKstDateTime(checkedAt);
   const body = [
-    '감시 중인 Notion 페이지가 업데이트되었습니다.',
+    '감시 중인 Notion 상품 재고가 업데이트되었습니다.',
     '',
     `확인 시각: ${checkedAtText}`,
-    `이전 본문 길이: ${previousTextLength}자`,
-    `현재 본문 길이: ${currentTextLength}자`,
+    `이전 상품 수: ${previousProductCount}개`,
+    `현재 상품 수: ${currentProductCount}개`,
     '',
-    '상품 표 변경점:',
-    tableDiff || '상품 표를 추출하지 못했습니다.'
+    '상품별 변경점:',
+    catalogDiff || '변경 상세가 없습니다.'
   ].join('\n');
 
   const response = await fetch(url, {
@@ -680,17 +670,13 @@ async function fetchPageSnapshotWithRetries(deps, config, previousState) {
   return { ok: false, reason: lastReason };
 }
 
-function validateFetchedSnapshot(snapshot, config, previousState) {
+function validateFetchedSnapshot(snapshot, config) {
   const unusableReason = getUnusablePageReason(snapshot);
   if (unusableReason) throw new PageFetchError(unusableReason);
 
   const normalizedText = normalizeText(snapshot.text || '');
   if (normalizedText.length < config.minTextLength) {
     throw new PageFetchError('body below minimum length');
-  }
-
-  if (previousState && isSuspiciousTextSizeChange(previousState.text || '', normalizedText, config.maxTextChangeRatio)) {
-    throw new PageFetchError('body length changed suspiciously');
   }
 }
 
@@ -785,19 +771,207 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function canonicalizeUrl(value, baseUrl) {
+  try {
+    const url = new URL(value, baseUrl);
+    url.hash = '';
+    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'].forEach((key) => url.searchParams.delete(key));
+    return url.href.replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+}
+
+function normalizeValue(value) {
+  return `${value || ''}`.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeStatus(value) {
+  const text = normalizeValue(value);
+  if (/품절|sold\s*out|out\s*of\s*stock/i.test(text)) return 'sold_out';
+  if (/판매\s*중|for\s*sale|in\s*stock|available/i.test(text)) return 'for_sale';
+  if (/판매\s*종료|discontinued|closed/i.test(text)) return 'discontinued';
+  return text.toLowerCase();
+}
+
+function normalizeProduct(product) {
+  const characterMap = new Map((product.characters || []).map((character) => [normalizeValue(character.name), {
+    name: normalizeValue(character.name),
+    status: normalizeStatus(character.status)
+  }]));
+  const characters = [...characterMap.values()].filter((character) => character.name).sort((a, b) =>
+    a.name.localeCompare(b.name, 'ko-KR') || a.status.localeCompare(b.status, 'ko-KR'));
+  return {
+    url: canonicalizeUrl(product.url, product.url),
+    name: normalizeValue(product.name),
+    price: normalizeValue(product.price).replace(/\s+/g, ''),
+    status: normalizeStatus(product.status),
+    characters
+  };
+}
+
+function normalizeCatalog(products) {
+  if (!Array.isArray(products) && Array.isArray(products?.products)) products = products.products;
+  return {
+    version: 1,
+    products: products.map(normalizeProduct).sort((a, b) =>
+      a.url.localeCompare(b.url) || a.name.localeCompare(b.name, 'ko-KR'))
+  };
+}
+
+function serializeCatalog(catalog) {
+  return `${JSON.stringify(catalog, null, 2)}\n`;
+}
+
+function diffCatalog(previousCatalog, currentCatalog) {
+  const previous = new Map((previousCatalog?.products || []).map((product) => [product.url, product]));
+  const current = new Map((currentCatalog?.products || []).map((product) => [product.url, product]));
+  const changes = [];
+  for (const [url, product] of current) {
+    if (!previous.has(url)) {
+      changes.push({ type: 'added', url, name: product.name, changes: [{ field: 'product', after: product }] });
+      continue;
+    }
+    const before = previous.get(url);
+    const fields = [];
+    for (const field of ['name', 'price', 'status']) {
+      if (before[field] !== product[field]) fields.push({ field, before: before[field], after: product[field] });
+    }
+    const oldCharacters = new Map(before.characters.map((item) => [item.name, item.status]));
+    const newCharacters = new Map(product.characters.map((item) => [item.name, item.status]));
+    for (const [name, status] of newCharacters) {
+      if (!oldCharacters.has(name)) fields.push({ field: 'character_added', name, after: status });
+      else if (oldCharacters.get(name) !== status) fields.push({ field: 'character_status', name, before: oldCharacters.get(name), after: status });
+    }
+    for (const [name, status] of oldCharacters) {
+      if (!newCharacters.has(name)) fields.push({ field: 'character_removed', name, before: status });
+    }
+    if (fields.length) changes.push({ type: 'changed', url, name: product.name || before.name, changes: fields });
+  }
+  for (const [url, product] of previous) {
+    if (!current.has(url)) changes.push({ type: 'removed', url, name: product.name, changes: [{ field: 'product', before: product }] });
+  }
+  return changes.sort((a, b) => a.url.localeCompare(b.url));
+}
+
+async function collectProductUrls(page, mainUrl) {
+  const hrefs = await page.evaluate(() => [...document.querySelectorAll(
+    '.notion-collection-item a[href], a.notion-collection-item[href], [data-block-id] a[href]'
+  )].map((anchor) => anchor.href));
+  return [...new Set(hrefs.map((href) => canonicalizeUrl(href, mainUrl)).filter((url) => url && url !== canonicalizeUrl(mainUrl, mainUrl)))];
+}
+
+async function extractProductDetail(page, url) {
+  const raw = await page.evaluate(() => {
+    const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
+    const title = clean(document.querySelector('h1, [contenteditable="true"][data-content-editable-leaf="true"]')?.textContent) || clean(document.title).replace(/\s*[|–-]\s*Notion.*$/i, '');
+    const text = clean(document.querySelector('.notion-page-content, main, article')?.innerText || document.body.innerText);
+    const price = text.match(/(?:₩\s*)?\d{1,3}(?:,\d{3})*\s*원?|₩\s*\d[\d,]*/)?.[0] || '';
+    const status = text.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i)?.[0] || '';
+    const characters = [];
+    const pattern = /([^|\n,()]{1,80}?)\s*\((판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\)/gi;
+    let match;
+    while ((match = pattern.exec(text))) characters.push({ name: clean(match[1]), status: clean(match[2]) });
+    document.querySelectorAll('tr, [role="row"], .notion-toggle-block, details').forEach((row) => {
+      const rowText = clean(row.innerText || row.textContent);
+      const rowStatus = rowText.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i)?.[0];
+      if (!rowStatus) return;
+      const name = clean(rowText.replace(rowStatus, '').replace(/[|:()]/g, ' '));
+      if (name && name !== title && name.length <= 80) characters.push({ name, status: rowStatus });
+    });
+    return { name: title, price, status, characters, text };
+  });
+  assertNotionContentLooksUsable({ url: page.url(), title: raw.name, text: raw.text, renderedCandidateCount: 1 });
+  if (!raw.name) throw new PageFetchError('product name not found');
+  return { url, name: raw.name, price: raw.price, status: raw.status, characters: raw.characters };
+}
+
+async function fetchProductCatalog(notionPageUrl, config = {}) {
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const mainContext = await browser.newContext({ locale: 'ko-KR' });
+    const mainPage = await mainContext.newPage();
+    await mainPage.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
+    await mainPage.waitForSelector('.notion-collection-item a[href], [data-block-id] a[href]', { timeout: config.collectionWaitMs }).catch(() => null);
+    await mainPage.waitForTimeout(config.extraWaitMs);
+    const urls = await collectProductUrls(mainPage, notionPageUrl);
+    await mainContext.close();
+    if (!urls.length) throw new PageFetchError('product detail URLs not found');
+
+    const products = new Array(urls.length);
+    const failures = [];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < urls.length) {
+        const index = cursor++;
+        const url = urls[index];
+        let lastError;
+        for (let attempt = 1; attempt <= config.pageFetchMaxAttempts; attempt += 1) {
+          const context = await browser.newContext({ locale: 'ko-KR' });
+          try {
+            const page = await context.newPage();
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
+            await page.waitForSelector('.notion-page-content, main, article', { timeout: config.renderWaitMs });
+            await page.waitForTimeout(config.extraWaitMs);
+            products[index] = await extractProductDetail(page, url);
+            lastError = null;
+            break;
+          } catch (error) {
+            lastError = createPageFetchError(error);
+            if (attempt < config.pageFetchMaxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
+          } finally {
+            await context.close().catch(() => undefined);
+          }
+        }
+        if (lastError) failures.push({ url, reason: lastError.reason });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(config.detailConcurrency || 2, urls.length) }, worker));
+    if (failures.length) {
+      const error = new PageFetchError('product detail fetch failed', failures.map((item) => item.url).join(', '));
+      error.failures = failures;
+      throw error;
+    }
+    return normalizeCatalog(products);
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+function formatCatalogDiff(diff) {
+  return diff.flatMap((item) => {
+    const header = `${item.type === 'added' ? '추가' : item.type === 'removed' ? '삭제' : '변경'}: ${item.name || item.url}`;
+    const details = item.changes.map((change) => {
+      if (change.field === 'character_status') return `- ${change.name}: ${change.before} → ${change.after}`;
+      if (change.field === 'character_added') return `- 캐릭터 추가 ${change.name}: ${change.after}`;
+      if (change.field === 'character_removed') return `- 캐릭터 삭제 ${change.name}: ${change.before}`;
+      if (change.field === 'product') return '- 상품 전체';
+      return `- ${change.field}: ${change.before || '(없음)'} → ${change.after || '(없음)'}`;
+    });
+    return [header, ...details];
+  }).join('\n');
+}
+
+async function saveChangeArtifacts(snapshotDir, checkedAt, catalog, diff) {
+  const stamp = checkedAt.replace(/[:.]/g, '-');
+  const directory = path.resolve(snapshotDir);
+  await fs.mkdir(directory, { recursive: true });
+  await Promise.all([
+    saveStateAtomic(path.join(directory, `${stamp}.snapshot.json`), catalog),
+    saveStateAtomic(path.join(directory, `${stamp}.diff.json`), { checkedAt, changes: diff })
+  ]);
+}
+
 async function runOnce(options = {}) {
   const deps = {
-    fetchPageSnapshot: fetchNotionPageSnapshot,
-    fetchPageText: fetchNotionPageText,
+    fetchCatalog: fetchProductCatalog,
     sendNotification: sendNtfyNotification,
     sendOperatorNotification,
     sleep,
     now: () => new Date(),
     ...options.deps
   };
-  if (options.deps && options.deps.fetchPageText && !options.deps.fetchPageSnapshot) {
-    deps.fetchPageSnapshot = null;
-  }
 
   let config;
   let lock;
@@ -821,32 +995,23 @@ async function runOnce(options = {}) {
       throw error;
     }
 
-    const fetchResult = await fetchPageSnapshotWithRetries(deps, config, previousState);
-    if (!fetchResult.ok) {
-      await recordPageFetchFailure(config, deps, fetchResult.reason);
-      throw new PageFetchError(fetchResult.reason || 'page fetch failed');
+    let catalog;
+    try {
+      catalog = normalizeCatalog(await deps.fetchCatalog(config.notionPageUrl, config));
+    } catch (error) {
+      const fetchError = createPageFetchError(error);
+      await recordPageFetchFailure(config, deps, fetchError.reason);
+      throw fetchError;
     }
-
     await recordPageFetchSuccess(config, deps);
-
-    const snapshot = fetchResult.snapshot;
-    const normalizedText = normalizeText(snapshot.text);
-    const normalizedTableText = normalizeText(snapshot.tableText || '');
-    const normalizedUpdateText = normalizeText(snapshot.updateText || '');
-
-    log('INFO', '본문 추출에 성공했습니다.');
-    const hash = createHash(normalizedText);
-    const { changeKey, changeKeyType } = getChangeKey(hash, normalizedUpdateText);
+    const json = serializeCatalog(catalog);
+    const hash = createHash(json);
     const checkedAt = deps.now().toISOString();
 
     if (!previousState) {
       await saveStateWithLog(config.stateFile, {
         hash,
-        changeKey,
-        changeKeyType,
-        updateText: normalizedUpdateText,
-        text: normalizedText,
-        tableText: normalizedTableText,
+        catalog,
         checkedAt,
         changedAt: null
       });
@@ -854,16 +1019,11 @@ async function runOnce(options = {}) {
       return 0;
     }
 
-    const previousChangeKey = getPreviousChangeKey(previousState);
-    if (previousChangeKey === changeKey) {
+    if (previousState.hash === hash) {
       await saveStateWithLog(config.stateFile, {
         ...previousState,
         hash,
-        changeKey,
-        changeKeyType,
-        updateText: normalizedUpdateText,
-        text: normalizedText,
-        tableText: normalizedTableText,
+        catalog,
         checkedAt,
         changedAt: previousState.changedAt || null
       });
@@ -871,26 +1031,19 @@ async function runOnce(options = {}) {
       return 0;
     }
 
-    log('INFO', '페이지 변경을 감지했습니다.');
-    const tableDiff = createTableDiff(getPreviousTableText(previousState), normalizedTableText);
+    log('INFO', '상품 변경을 감지했습니다.');
+    const diff = diffCatalog(previousState.catalog || { products: [] }, catalog);
+    const diffText = formatCatalogDiff(diff);
     try {
-      await deps.sendNotification(config, checkedAt, (previousState.text || '').length, normalizedText.length, tableDiff);
+      await deps.sendNotification(config, checkedAt, previousState.catalog?.products?.length || 0, catalog.products.length, diffText);
       log('INFO', 'ntfy 알림을 전송했습니다.');
     } catch (error) {
       log('ERROR', 'ntfy 알림 전송에 실패했습니다.');
       throw error;
     }
 
-    await saveStateWithLog(config.stateFile, {
-      hash,
-      changeKey,
-      changeKeyType,
-      updateText: normalizedUpdateText,
-      text: normalizedText,
-      tableText: normalizedTableText,
-      checkedAt,
-      changedAt: checkedAt
-    });
+    await saveChangeArtifacts(config.snapshotDir, checkedAt, catalog, diff);
+    await saveStateWithLog(config.stateFile, { hash, catalog, checkedAt, changedAt: checkedAt });
     log('INFO', '새로운 상태를 저장했습니다.');
     return 0;
   } catch (error) {
@@ -898,7 +1051,7 @@ async function runOnce(options = {}) {
       log('ERROR', error.message);
     } else if (/ntfy/.test(error.message)) {
       log('ERROR', error.message);
-    } else if (/필수 환경변수|MIN_TEXT_LENGTH|MAX_TEXT_CHANGE_RATIO|STALE_LOCK_MS|TIMEOUT_MS|WAIT_MS/.test(error.message)) {
+    } else if (/필수 환경변수|MIN_TEXT_LENGTH|DETAIL_CONCURRENCY|STALE_LOCK_MS|TIMEOUT_MS|WAIT_MS/.test(error.message)) {
       log('ERROR', error.message);
     } else if (error instanceof PageFetchError || /페이지 조회|본문|navigation timeout|network error|body/.test(error.message)) {
       log('ERROR', error.message);
@@ -946,13 +1099,21 @@ module.exports = {
   extractUpdateTextFromText,
   formatKstDateTime,
   createTableDiff,
-  isSuspiciousTextSizeChange,
+  canonicalizeUrl,
+  normalizeProduct,
+  normalizeCatalog,
+  serializeCatalog,
+  diffCatalog,
+  collectProductUrls,
+  extractProductDetail,
+  fetchProductCatalog,
+  formatCatalogDiff,
   sendNtfyNotification,
   runOnce,
   isLockStaleOrInvalid,
   createDesktopUserAgent,
   DEFAULT_MIN_TEXT_LENGTH,
-  DEFAULT_MAX_TEXT_CHANGE_RATIO,
+  DEFAULT_DETAIL_CONCURRENCY,
   DEFAULT_STALE_LOCK_MS,
   DEFAULT_PAGE_LOAD_TIMEOUT_MS,
   DEFAULT_PAGE_TIMEOUT_MS: DEFAULT_PAGE_LOAD_TIMEOUT_MS,
