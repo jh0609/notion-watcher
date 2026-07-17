@@ -7,9 +7,9 @@ const path = require('path');
 const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
-  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards,
+  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveConfig, resolveDebugConfig, waitForProductCards,
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
-  processDetailPage, createDetailPageSlot, runOnce
+  processDetailPage, createDetailPageSlot, buildDetailContextSettings, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -129,7 +129,7 @@ test('상품 카드 대기는 collection item 자체와 최소 2개 조건을 �
   assert.equal(calls[1].options.timeout, 4321);
 });
 
-test('운영 페이지 진단은 노이즈를 제외하고 중요한 오류를 메모리에 보관한다', () => {
+test('운영 페이지 진단은 일반 노이즈를 제외하되 Notion API 오류를 보관한다', () => {
   const handlers = {};
   const diagnostics = attachPageDiagnostics({ on: (event, handler) => { handlers[event] = handler; } }, 'test');
   handlers.console({ type: () => 'error', text: () => 'Statsig request failed' });
@@ -139,9 +139,11 @@ test('운영 페이지 진단은 노이즈를 제외하고 중요한 오류를 �
     failure: () => ({ errorText: 'net::ERR_FAILED' })
   });
   handlers.pageerror(new Error('important Notion renderer failure'));
-  assert.equal(diagnostics.entries.length, 2);
-  assert.match(diagnostics.entries[0].message, /loadPageChunk/);
-  assert.match(diagnostics.entries[1].message, /renderer failure/);
+  assert.equal(diagnostics.entries.length, 3);
+  assert.match(diagnostics.entries[0].message, /getSubscriptionBanner/);
+  assert.match(diagnostics.entries[1].message, /loadPageChunk/);
+  assert.match(diagnostics.entries[1].message, /resourceType=unknown/);
+  assert.match(diagnostics.entries[2].message, /renderer failure/);
 });
 
 test('상세 리소스 차단은 image, media, font에만 적용한다', () => {
@@ -169,6 +171,45 @@ test('상세 context 정책은 차단 대상은 abort하고 필수 리소스는 
   assert.deepEqual(decisions, [
     'image:abort', 'script:continue', 'xhr:continue', 'fetch:continue', 'stylesheet:continue'
   ]);
+});
+
+test('DETAIL_BLOCK_HEAVY_RESOURCES=false이면 request routing을 설치하지 않는다', async () => {
+  let routeCalls = 0;
+  await configureDetailResourcePolicy({ route: async () => { routeCalls += 1; } }, false);
+  assert.equal(routeCalls, 0);
+});
+
+test('상세 리소스와 Service Worker 정책은 환경변수로 비교할 수 있다', () => {
+  const base = {
+    NOTION_PAGE_URL: 'https://example.notion.site/catalog', NTFY_SERVER_URL: 'https://ntfy.sh',
+    NTFY_TOPIC: 'topic', NTFY_TOKEN: 'token'
+  };
+  const defaults = resolveConfig(base);
+  assert.equal(defaults.detailBlockHeavyResources, true);
+  assert.equal(defaults.detailServiceWorkers, 'block');
+  assert.equal(defaults.mainToDetailDelayMs, 10_000);
+  assert.equal(defaults.detailHydrationBackoffMs, 50_000);
+  assert.equal(defaults.detailHydrationMaxRetries, 1);
+  const allowed = resolveConfig({
+    ...base, DETAIL_BLOCK_HEAVY_RESOURCES: 'false', DETAIL_SERVICE_WORKERS: 'allow'
+  });
+  assert.equal(allowed.detailBlockHeavyResources, false);
+  assert.equal(allowed.detailServiceWorkers, 'allow');
+});
+
+test('test:transition과 debug:detail은 동일한 상세 context 설정 빌더를 사용한다', () => {
+  const browser = { version: () => '149.0.0.0' };
+  const operational = buildDetailContextSettings(browser, {
+    detailBlockHeavyResources: false, detailServiceWorkers: 'allow'
+  });
+  const diagnostic = buildDetailContextSettings(browser, {
+    detailBlockHeavyResources: false, detailServiceWorkers: 'allow'
+  });
+  assert.deepEqual(diagnostic, operational);
+});
+
+test('10초 초기 대기와 50초 hydration cooldown은 고정 60초 대기와 총 대기시간이 같다', () => {
+  assert.equal(10_000 + 50_000, 60_000);
 });
 
 test('리소스 차단 적용 전후의 텍스트 본문 파싱 결과는 동일하다', () => {

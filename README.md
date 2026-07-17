@@ -60,7 +60,11 @@ DETAIL_NAVIGATION_TIMEOUT_MS=20000
 DETAIL_READY_TIMEOUT_MS=10000
 DETAIL_HARD_TIMEOUT_MS=35000
 DETAIL_REUSE_PAGES=true
-MAIN_TO_DETAIL_DELAY_MS=1500
+DETAIL_BLOCK_HEAVY_RESOURCES=true
+DETAIL_SERVICE_WORKERS=block
+DETAIL_HYDRATION_BACKOFF_MS=50000
+DETAIL_HYDRATION_MAX_RETRIES=1
+MAIN_TO_DETAIL_DELAY_MS=10000
 DEBUG_DOM=false
 DEBUG_DIR=./debug
 DEBUG_SAVE_SCREENSHOTS=false
@@ -78,9 +82,9 @@ OPERATOR_NTFY_TOPIC=
 
 `SNAPSHOT_DIR`은 변경 시 전체 상품 JSON과 상품별 diff JSON을 저장할 디렉터리이며 기본값은 `./snapshots`입니다. `DETAIL_CONCURRENCY`는 `1` 또는 `2`만 허용하며 1GB 서버를 고려한 기본값은 `1`입니다. 동시성 `2`의 첫 두 page가 모두 hydration stall이면 실행 중 자동으로 `1`로 낮춥니다.
 
-상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 허용합니다. Service Worker는 차단됩니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 가격과 판매 상태 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
+상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. 기본적으로 `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 항상 허용합니다. `DETAIL_BLOCK_HEAVY_RESOURCES=false`이면 이미지·미디어·폰트도 허용합니다. `DETAIL_SERVICE_WORKERS=block|allow`로 Service Worker 정책을 비교할 수 있습니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
 
-메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `1500`)만큼 기다린 다음 별도의 상세 browser/context를 한 번 생성해 전체 상품에 재사용합니다.
+메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `10000`)만큼 기다린 다음 별도의 상세 browser/context를 생성합니다. 첫 URL preflight가 hydration stall이면 그 세션을 완전히 종료하고 `DETAIL_HYDRATION_BACKOFF_MS`(기본 `50000`) 후 새 세션으로 재시도합니다. 재시도 횟수는 `DETAIL_HYDRATION_MAX_RETRIES`(기본 `1`)로 제한하며, 성공한 preflight 결과는 첫 상품 결과로 재사용합니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 
@@ -120,6 +124,8 @@ NOTION_PAGE_URL=https://example.notion.site/<catalog-id> npm run debug:transitio
 ```
 
 이 명령은 `npm run test:transition`으로도 실행할 수 있으며, 새 상세 browser에서 본문이 비어 있거나 파싱에 실패하면 0이 아닌 종료 코드로 끝나는 실제 페이지 통합 테스트입니다.
+
+`npm run benchmark:transition`은 `10초 초기 대기 + hydration stall 시 50초 cooldown`과 `고정 60초 초기 대기`를 실제 전체 파이프라인으로 각각 실행해 성공 여부와 소요시간을 JSON으로 비교합니다.
 
 느린 서버에서는 다음 대기 시간을 `.env`에서 늘릴 수 있습니다. 값은 모두 밀리초입니다.
 

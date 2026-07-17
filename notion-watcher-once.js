@@ -16,7 +16,9 @@ const DEFAULT_DETAIL_CONCURRENCY = 1;
 const DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS = 20 * 1000;
 const DEFAULT_DETAIL_READY_TIMEOUT_MS = 10 * 1000;
 const DEFAULT_DETAIL_HARD_TIMEOUT_MS = 35 * 1000;
-const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 1500;
+const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 10 * 1000;
+const DEFAULT_DETAIL_HYDRATION_BACKOFF_MS = 50 * 1000;
+const DEFAULT_DETAIL_HYDRATION_MAX_RETRIES = 1;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
 const DEFAULT_PAGE_LOAD_TIMEOUT_MS = 60 * 1000;
@@ -130,6 +132,10 @@ function resolveConfig(env = process.env) {
   const detailReadyTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS);
   const detailHardTimeoutMs = parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS);
   const mainToDetailDelayMs = parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
+  const detailBlockHeavyResources = parseBooleanEnv(env.DETAIL_BLOCK_HEAVY_RESOURCES, true);
+  const detailServiceWorkers = parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS);
+  const detailHydrationBackoffMs = parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS);
+  const detailHydrationMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
     throw new Error('MIN_TEXT_LENGTH는 1 이상의 숫자여야 합니다.');
@@ -159,6 +165,10 @@ function resolveConfig(env = process.env) {
     detailHardTimeoutMs,
     detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
     mainToDetailDelayMs,
+    detailBlockHeavyResources,
+    detailServiceWorkers,
+    detailHydrationBackoffMs,
+    detailHydrationMaxRetries,
     staleLockMs,
     pageLoadTimeoutMs,
     pageTimeoutMs: pageLoadTimeoutMs,
@@ -204,7 +214,9 @@ function resolveSingleDetailConfig(env = process.env) {
     url,
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
-    detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS)
+    detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS),
+    detailBlockHeavyResources: parseBooleanEnv(env.DETAIL_BLOCK_HEAVY_RESOURCES, true),
+    detailServiceWorkers: parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS)
   };
 }
 
@@ -219,6 +231,12 @@ function resolveTransitionDiagnosticConfig(env = process.env) {
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
     detailHardTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_HARD_TIMEOUT_MS', DEFAULT_DETAIL_HARD_TIMEOUT_MS),
+    detailConcurrency: parsePositiveIntegerEnv(env, 'DETAIL_CONCURRENCY', DEFAULT_DETAIL_CONCURRENCY),
+    detailReusePages: parseBooleanEnv(env.DETAIL_REUSE_PAGES, true),
+    detailBlockHeavyResources: parseBooleanEnv(env.DETAIL_BLOCK_HEAVY_RESOURCES, true),
+    detailServiceWorkers: parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS),
+    detailHydrationBackoffMs: parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS),
+    detailHydrationMaxRetries: parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES),
     mainToDetailDelayMs: parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS)
   };
 }
@@ -237,6 +255,20 @@ function parsePositiveIntegerEnv(env, name, defaultValue) {
     throw new Error(`${name}는 1 이상의 숫자여야 합니다.`);
   }
   return value;
+}
+
+function parseNonNegativeIntegerEnv(env, name, defaultValue) {
+  const value = Number.parseInt(env[name] ?? `${defaultValue}`, 10);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${name}는 0 이상의 숫자여야 합니다.`);
+  return value;
+}
+
+function parseDetailServiceWorkers(value) {
+  const normalized = `${value || 'block'}`.trim().toLowerCase();
+  if (normalized !== 'block' && normalized !== 'allow') {
+    throw new Error('DETAIL_SERVICE_WORKERS는 block 또는 allow여야 합니다.');
+  }
+  return normalized;
 }
 
 function parseRetryDelaysEnv(value, defaultValue) {
@@ -533,6 +565,8 @@ const IGNORED_OPERATION_DIAGNOSTIC_PATTERNS = [
 ];
 
 function isIgnoredOperationDiagnostic(message) {
+  // These are essential to diagnosing an empty Notion shell and must never be hidden.
+  if (/notion[^\s]*\/api\/v3\/|\/api\/v3\/|\/_assets\/.*(?:\.js|js\/)|\.js(?:[?#\s]|$)|resourceType=(?:script|xhr|fetch)/i.test(message)) return false;
   return IGNORED_OPERATION_DIAGNOSTIC_PATTERNS.some((pattern) => pattern.test(message));
 }
 
@@ -546,17 +580,20 @@ function attachPageDiagnostics(page, label = 'main-page', options = {}) {
     if (entries.length > 100) entries.shift();
     if (verbose) log(level, message);
   };
-  page.on('pageerror', (error) => record('ERROR', `[${label}] pageerror: ${error.message}`));
+  page.on('pageerror', (error) => record('ERROR', `[${label}] pageerror: URL=${page.url?.() || 'unknown'} HTTP=none resourceType=document errorText=${error.message}`));
   page.on('console', (message) => {
     if (message.type() === 'error' || message.type() === 'warning') {
-      record(message.type() === 'error' ? 'ERROR' : 'WARN', `[${label}] console ${message.type()}: ${message.text()}`);
+      record(message.type() === 'error' ? 'ERROR' : 'WARN', `[${label}] console ${message.type()}: URL=${page.url?.() || 'unknown'} HTTP=none resourceType=console errorText=${message.text()}`);
     }
   });
   page.on('requestfailed', (request) => {
-    record('WARN', `[${label}] requestfailed: ${request.url()} (${request.failure()?.errorText || 'unknown error'})`);
+    record('WARN', `[${label}] requestfailed: URL=${request.url()} HTTP=none resourceType=${request.resourceType?.() || 'unknown'} errorText=${request.failure()?.errorText || 'unknown error'}`);
   });
   page.on('response', (response) => {
-    if (response.status() >= 400) record('WARN', `[${label}] HTTP ${response.status()}: ${response.url()}`);
+    if (response.status() >= 400) {
+      const request = response.request?.();
+      record('WARN', `[${label}] response: URL=${response.url()} HTTP=${response.status()} resourceType=${request?.resourceType?.() || 'unknown'} errorText=none`);
+    }
   });
   return {
     entries,
@@ -1334,7 +1371,8 @@ function shouldAbortDetailResource(resourceType) {
   return resourceType === 'image' || resourceType === 'media' || resourceType === 'font';
 }
 
-async function configureDetailResourcePolicy(context) {
+async function configureDetailResourcePolicy(context, enabled = true) {
+  if (!enabled) return;
   await context.route('**/*', async (route) => {
     if (shouldAbortDetailResource(route.request().resourceType())) await route.abort();
     else await route.continue();
@@ -1346,14 +1384,20 @@ function logMemoryStage(stage) {
   log('INFO', `${stage} 메모리: ${JSON.stringify({ rss: memory.rss, heapUsed: memory.heapUsed, osFreeMemory: memory.osFreeMemory })}`);
 }
 
-async function createDetailBrowserSession() {
+async function createDetailBrowserSession(config = {}) {
   const { chromium } = require('playwright');
   const browser = await chromium.launch(getChromiumLaunchOptions());
   log('INFO', '상세 browser 생성 완료');
   logMemoryStage('상세 browser 생성 완료');
   try {
-    const context = await browser.newContext({ ...getBrowserContextOptions(browser), serviceWorkers: 'block' });
-    await configureDetailResourcePolicy(context);
+    const browserContextOptions = getBrowserContextOptions(browser);
+    const contextSettings = buildDetailContextSettings(browser, config);
+    log('INFO', `상세 context 설정: ${JSON.stringify(contextSettings)}`);
+    const context = await browser.newContext({
+      ...browserContextOptions,
+      serviceWorkers: contextSettings.serviceWorkers
+    });
+    await configureDetailResourcePolicy(context, contextSettings.blockHeavyResources);
     log('INFO', '상세 context 생성 완료');
     logMemoryStage('상세 context 생성 완료');
     return { browser, context };
@@ -1361,6 +1405,45 @@ async function createDetailBrowserSession() {
     await browser.close();
     throw error;
   }
+}
+
+async function closeDetailBrowserSession(session) {
+  if (!session) return;
+  await session.context.close().catch(() => undefined);
+  await session.browser.close().catch(() => undefined);
+}
+
+async function runDetailPreflight(url, config, session, attempt, maxAttempts) {
+  const page = await session.context.newPage();
+  const startedAt = Date.now();
+  log('INFO', `상세 preflight 시작 (${attempt}/${maxAttempts}): ${url}`);
+  try {
+    const product = await processDetailPage(page, url, {
+      ...config,
+      detailAttemptIsLast: attempt === maxAttempts
+    }, `상세 preflight [workerId=preflight, pageId=${attempt}]`);
+    return { product, durationMs: Date.now() - startedAt };
+  } finally {
+    await closePageSafely(page);
+  }
+}
+
+function buildDetailContextSettings(browser, config = {}) {
+  return {
+    ...getBrowserContextOptions(browser),
+    serviceWorkers: config.detailServiceWorkers || 'block',
+    blockHeavyResources: config.detailBlockHeavyResources !== false
+  };
+}
+
+const DETAIL_DIAGNOSTICS = Symbol('detailDiagnostics');
+
+function getDetailPageDiagnostics(page, label, config) {
+  if (typeof page.on !== 'function') return { entries: [], flush: () => undefined };
+  if (!page[DETAIL_DIAGNOSTICS]) {
+    page[DETAIL_DIAGNOSTICS] = attachPageDiagnostics(page, label, { verbose: Boolean(config.debugDom) });
+  }
+  return page[DETAIL_DIAGNOSTICS];
 }
 
 async function closePageSafely(page, timeoutMs = 2000) {
@@ -1400,6 +1483,7 @@ async function processDetailPage(page, url, config, logPrefix) {
   const hardTimeoutMs = config.detailHardTimeoutMs || DEFAULT_DETAIL_HARD_TIMEOUT_MS;
   page.setDefaultNavigationTimeout(navigationTimeoutMs);
   page.setDefaultTimeout(readyTimeoutMs);
+  const pageDiagnostics = getDetailPageDiagnostics(page, logPrefix, config);
   log('INFO', `${logPrefix} timeout 설정: navigation=${navigationTimeoutMs}ms, ready=${readyTimeoutMs}ms, hard=${hardTimeoutMs}ms`);
 
   const expectedPageId = extractNotionPageId(url, url);
@@ -1441,7 +1525,18 @@ async function processDetailPage(page, url, config, logPrefix) {
         }, expectedPageId).catch(() => ({ diagnosticUnavailable: true }));
         log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
         log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
+        pageDiagnostics.flush(30);
         if (diagnostic.documentReadyState === 'interactive' && diagnostic.bodyTextLength === 0) {
+          if (config.detailAttemptIsLast) {
+            const failedHtmlPath = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR, 'detail-page-failed.html');
+            try {
+              await fs.mkdir(path.dirname(failedHtmlPath), { recursive: true });
+              await fs.writeFile(failedHtmlPath, await page.content(), 'utf8');
+              log('INFO', `마지막 상세 실패 HTML 저장: ${failedHtmlPath}`);
+            } catch (saveError) {
+              log('WARN', `마지막 상세 실패 HTML 저장 실패: ${saveError.message}`);
+            }
+          }
           throw new PageFetchError('hydration stall', `readyState=interactive, bodyTextLength=0`);
         }
       }
@@ -1601,9 +1696,8 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
   }
 
   await sleep(config.mainToDetailDelayMs || DEFAULT_MAIN_TO_DETAIL_DELAY_MS);
-  const detailSession = await createDetailBrowserSession();
-  const browser = detailSession.browser;
-  const detailContext = detailSession.context;
+  let detailSession = await createDetailBrowserSession(config);
+  let detailContext = detailSession.context;
   try {
     if (!urls.length) throw new PageFetchError('product detail URLs not found');
 
@@ -1612,9 +1706,33 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     const detailConcurrency = Math.min(config.detailConcurrency || DEFAULT_DETAIL_CONCURRENCY, urls.length);
     const detailStartedAt = Date.now();
     const detailDurationsMs = [];
+    const hydrationMaxRetries = config.detailHydrationMaxRetries ?? DEFAULT_DETAIL_HYDRATION_MAX_RETRIES;
+    const preflightMaxAttempts = hydrationMaxRetries + 1;
+    for (let attempt = 1; attempt <= preflightMaxAttempts; attempt += 1) {
+      try {
+        const preflight = await runDetailPreflight(urls[0], config, detailSession, attempt, preflightMaxAttempts);
+        products[0] = preflight.product;
+        detailDurationsMs.push(preflight.durationMs);
+        log('INFO', attempt > 1
+          ? `preflight 복구 성공: ${preflight.product.name}`
+          : `상세 preflight 성공: ${preflight.product.name}`);
+        break;
+      } catch (error) {
+        const failure = createPageFetchError(error);
+        if (failure.reason !== 'hydration stall' || attempt === preflightMaxAttempts) throw failure;
+        log('WARN', '상세 preflight hydration stall 감지');
+        await closeDetailBrowserSession(detailSession);
+        const backoffMs = config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS;
+        log('INFO', `${Math.round(backoffMs / 1000)}초 cooldown 시작`);
+        await sleep(backoffMs);
+        detailSession = await createDetailBrowserSession(config);
+        detailContext = detailSession.context;
+        log('INFO', 'hydration 재시도용 새 상세 browser 생성 완료');
+      }
+    }
     const reusePages = config.detailReusePages !== false;
     log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
-    let cursor = 0;
+    let cursor = 1;
     const retryQueue = [];
     const activePages = new Set();
     let downgradedToSerial = false;
@@ -1626,6 +1744,9 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       firstWaveOutcomes.set(index, hydrationStall);
       if (firstWaveOutcomes.size === Math.min(2, urls.length)) resolveFirstWave();
     };
+    // URL 0 was already completed by preflight; include it in the first-wave
+    // barrier so concurrency=2 cannot wait forever for a worker-owned index 0.
+    recordFirstWave(0, false);
     const worker = async (workerIndex) => {
       const workerId = workerIndex + 1;
       const pageSlot = createDetailPageSlot(detailContext);
@@ -1655,7 +1776,8 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
             try {
               products[index] = await processDetailPage(page, url, {
                 ...config,
-                detailHardTimeoutMs: Math.min(hardTimeoutMs, remainingMs)
+                detailHardTimeoutMs: Math.min(hardTimeoutMs, remainingMs),
+                detailAttemptIsLast: attempt === maxAttempts
               }, logPrefix);
               recordFirstWave(index, false);
               if (index <= 1 && detailConcurrency === 2) await firstWaveDone;
@@ -1727,8 +1849,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     }
     return validateCatalog(normalizeCatalog(products));
   } finally {
-    await detailContext.close().catch(() => undefined);
-    await browser.close().catch(() => undefined);
+    await closeDetailBrowserSession(detailSession);
   }
 }
 
@@ -1775,7 +1896,7 @@ async function benchmarkDetails(config = resolveDetailBenchmarkConfig()) {
 }
 
 async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
-  const session = await createDetailBrowserSession();
+  const session = await createDetailBrowserSession(config);
   const browser = session.browser;
   const context = session.context;
   try {
@@ -1795,32 +1916,30 @@ async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
 }
 
 async function diagnoseMainToDetailTransition(config = resolveTransitionDiagnosticConfig()) {
-  const { chromium } = require('playwright');
-  const mainBrowser = await chromium.launch(getChromiumLaunchOptions());
-  let urls;
-  try {
-    ({ urls } = await discoverProductUrlsWithRetries(mainBrowser, config.notionPageUrl, config));
-  } finally {
-    await mainBrowser.close();
-    log('INFO', '메인 browser 종료 완료');
-    logMemoryStage('메인 browser 종료 완료');
-  }
-  await sleep(config.mainToDetailDelayMs);
-  const session = await createDetailBrowserSession();
-  try {
-    const page = await session.context.newPage();
+  log('INFO', '메인→상세 통합 진단은 npm start와 동일한 전체 상세 파이프라인을 사용합니다.');
+  const catalog = await fetchProductCatalog(config.notionPageUrl, config);
+  log('INFO', `메인→상세 통합 진단 성공: 상품 ${catalog.products.length}개`);
+  return catalog;
+}
+
+async function benchmarkMainToDetailTransition(baseConfig = resolveTransitionDiagnosticConfig()) {
+  const scenarios = [
+    { name: '10초 + hydration 50초 cooldown', mainToDetailDelayMs: 10_000, detailHydrationBackoffMs: 50_000, detailHydrationMaxRetries: 1 },
+    { name: '고정 60초 대기', mainToDetailDelayMs: 60_000, detailHydrationBackoffMs: 50_000, detailHydrationMaxRetries: 0 }
+  ];
+  const results = [];
+  for (const scenario of scenarios) {
+    const startedAt = Date.now();
     try {
-      const product = await processDetailPage(page, urls[0], config, '메인→상세 통합 진단 [workerId=1, pageId=1]');
-      if (!product.text || product.text.length === 0) throw new PageFetchError('transition detail body empty');
-      log('INFO', `메인→상세 통합 진단 성공: bodyTextLength=${product.text.length}, 상품=${product.name}`);
-      return product;
-    } finally {
-      await closePageSafely(page);
+      const catalog = await fetchProductCatalog(baseConfig.notionPageUrl, { ...baseConfig, ...scenario });
+      results.push({ name: scenario.name, success: true, products: catalog.products.length, elapsedMs: Date.now() - startedAt });
+    } catch (error) {
+      results.push({ name: scenario.name, success: false, error: error.message, elapsedMs: Date.now() - startedAt });
     }
-  } finally {
-    await session.context.close().catch(() => undefined);
-    await session.browser.close().catch(() => undefined);
   }
+  log('INFO', `메인→상세 전환 벤치마크 결과: ${JSON.stringify(results)}`);
+  if (results.some((result) => !result.success)) throw new PageFetchError('transition benchmark failed');
+  return results;
 }
 
 async function debugCards(config = resolveDebugConfig()) {
@@ -1989,7 +2108,12 @@ async function saveStateWithLog(stateFile, state) {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--debug-transition')) {
+  if (process.argv.includes('--benchmark-transition')) {
+    benchmarkMainToDetailTransition().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--debug-transition')) {
     diagnoseMainToDetailTransition().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -2053,6 +2177,7 @@ module.exports = {
   parseProductText,
   shouldAbortDetailResource,
   configureDetailResourcePolicy,
+  buildDetailContextSettings,
   createDetailBrowserSession,
   closePageSafely,
   createDetailPageSlot,
@@ -2063,6 +2188,7 @@ module.exports = {
   benchmarkDetails,
   diagnoseSingleDetail,
   diagnoseMainToDetailTransition,
+  benchmarkMainToDetailTransition,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
