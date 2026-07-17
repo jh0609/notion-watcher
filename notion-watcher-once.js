@@ -1351,33 +1351,47 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
 
     const products = new Array(urls.length);
     const failures = [];
+    const detailConcurrency = Math.min(config.detailConcurrency || DEFAULT_DETAIL_CONCURRENCY, urls.length);
+    const detailStartedAt = Date.now();
+    log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
     let cursor = 0;
     const worker = async () => {
       while (cursor < urls.length) {
         const index = cursor++;
         const url = urls[index];
+        const position = index + 1;
+        log('INFO', `상세 페이지 조회 ${position}/${urls.length}: ${url}`);
         let lastError;
-        for (let attempt = 1; attempt <= config.pageFetchMaxAttempts; attempt += 1) {
-          const context = await browser.newContext(getBrowserContextOptions(browser));
+        const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          let context;
           try {
+            context = await browser.newContext(getBrowserContextOptions(browser));
             const page = await context.newPage();
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
             await page.waitForSelector('.notion-page-content, main, article', { timeout: config.renderWaitMs });
             await page.waitForTimeout(config.extraWaitMs);
             products[index] = await extractProductDetail(page, url);
             lastError = null;
+            log('INFO', `상세 페이지 조회 ${position}/${urls.length} 완료: ${products[index].name}`);
             break;
           } catch (error) {
             lastError = createPageFetchError(error);
             if (attempt < config.pageFetchMaxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
           } finally {
-            await context.close().catch(() => undefined);
+            if (context) await context.close().catch(() => undefined);
           }
         }
-        if (lastError) failures.push({ url, reason: lastError.reason });
+        if (lastError) {
+          const reason = lastError.reason || lastError.message || 'unknown error';
+          failures.push({ url, reason });
+          log('WARN', `상세 페이지 조회 ${position}/${urls.length} 실패: ${reason}`);
+        }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(config.detailConcurrency || 2, urls.length) }, worker));
+    await Promise.all(Array.from({ length: detailConcurrency }, worker));
+    const elapsedMs = Date.now() - detailStartedAt;
+    log('INFO', `전체 상세 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초`);
     if (failures.length) {
       const error = new PageFetchError('product detail fetch failed', failures.map((item) => item.url).join(', '));
       error.failures = failures;
