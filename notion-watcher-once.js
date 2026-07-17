@@ -78,6 +78,11 @@ function log(level, message) {
   console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
 }
 
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || `${value}`.trim() === '') return defaultValue;
+  return /^(?:1|true|yes|on)$/i.test(`${value}`.trim());
+}
+
 function resolveConfig(env = process.env) {
   const missing = [];
   if (!env.NOTION_PAGE_URL) missing.push('NOTION_PAGE_URL');
@@ -134,8 +139,9 @@ function resolveConfig(env = process.env) {
     lockFile: env.LOCK_FILE || DEFAULT_LOCK_FILE,
     minTextLength,
     snapshotDir: env.SNAPSHOT_DIR || DEFAULT_SNAPSHOT_DIR,
-    debugDom: /^(?:1|true|yes|on)$/i.test(env.DEBUG_DOM || ''),
+    debugDom: parseBooleanEnv(env.DEBUG_DOM),
     debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR,
+    debugSaveScreenshots: parseBooleanEnv(env.DEBUG_SAVE_SCREENSHOTS),
     detailConcurrency,
     staleLockMs,
     pageLoadTimeoutMs,
@@ -160,8 +166,17 @@ function resolveDebugConfig(env = process.env) {
     collectionWaitMs: parsePositiveIntegerEnv(env, 'COLLECTION_WAIT_MS', DEFAULT_COLLECTION_WAIT_MS),
     extraWaitMs: parsePositiveIntegerEnv(env, 'EXTRA_WAIT_MS', DEFAULT_EXTRA_WAIT_MS),
     debugDom: true,
-    debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR
+    debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR,
+    debugSaveScreenshots: parseBooleanEnv(env.DEBUG_SAVE_SCREENSHOTS)
   };
+}
+
+async function saveDebugScreenshot(action, label) {
+  try {
+    await action();
+  } catch (error) {
+    log('WARN', `${label} 스크린샷 저장 실패: ${error.message}`);
+  }
 }
 
 function parsePositiveIntegerEnv(env, name, defaultValue) {
@@ -957,10 +972,13 @@ async function collectProductUrls(page, mainUrl) {
     await Promise.all(oldDebugFiles.filter((name) =>
       /^(?:main-page\.(?:html|png)|card-(?:candidates|click-results)\.json|modal-\d+\.(?:html|png))$/.test(name)
     ).map((name) => fs.unlink(path.join(debugDir, name)).catch(() => undefined)));
-    await Promise.all([
-      fs.writeFile(path.join(debugDir, 'main-page.html'), await page.content(), 'utf8'),
-      page.screenshot({ path: path.join(debugDir, 'main-page.png'), fullPage: true })
-    ]);
+    await fs.writeFile(path.join(debugDir, 'main-page.html'), await page.content(), 'utf8');
+    if (config.debugSaveScreenshots) {
+      await saveDebugScreenshot(
+        () => page.screenshot({ path: path.join(debugDir, 'main-page.png'), fullPage: true }),
+        'main-page'
+      );
+    }
   }
 
   const candidates = await page.evaluate(() => {
@@ -1083,8 +1101,15 @@ async function collectProductUrls(page, mainUrl) {
         modalData.links.forEach((link) => result.detected.push({ source: 'modal-link', ...link }));
         if (config.debugDom) {
           await fs.writeFile(path.join(debugDir, `modal-${modalNumber}.html`), modalData.html, 'utf8');
-          await modal.screenshot({ path: path.join(debugDir, `modal-${modalNumber}.png`) }).catch(() =>
-            page.screenshot({ path: path.join(debugDir, `modal-${modalNumber}.png`) }));
+          if (config.debugSaveScreenshots) {
+            await saveDebugScreenshot(async () => {
+              try {
+                await modal.screenshot({ path: path.join(debugDir, `modal-${modalNumber}.png`) });
+              } catch {
+                await page.screenshot({ path: path.join(debugDir, `modal-${modalNumber}.png`) });
+              }
+            }, `modal-${modalNumber}`);
+          }
         }
 
         if (!result.detected.some((item) => evaluateProductUrlCandidate(item, mainUrl).allowed)) {

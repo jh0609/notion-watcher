@@ -56,6 +56,7 @@ SNAPSHOT_DIR=./snapshots
 DETAIL_CONCURRENCY=2
 DEBUG_DOM=false
 DEBUG_DIR=./debug
+DEBUG_SAVE_SCREENSHOTS=false
 PAGE_LOAD_TIMEOUT_MS=60000
 PAGE_FETCH_MAX_ATTEMPTS=3
 PAGE_FETCH_RETRY_DELAYS_MS=10000,30000
@@ -72,10 +73,12 @@ OPERATOR_NTFY_TOPIC=
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 
-- `main-page.html`, `main-page.png`
+- `main-page.html`
 - `card-candidates.json`
 - `card-click-results.json`
-- modal/peek이 열린 카드의 `modal-N.html`, `modal-N.png`
+- modal/peek이 열린 카드의 `modal-N.html`
+
+`DEBUG_SAVE_SCREENSHOTS`의 기본값은 `false`입니다. `true`로 설정한 경우에만 `main-page.png`와 `modal-N.png`를 저장합니다. 스크린샷 저장이 실패해도 HTML/JSON 진단과 카드 조사는 계속 진행합니다.
 
 ntfy 설정 없이 실제 Notion 카드만 수동 진단하려면 `NOTION_PAGE_URL`을 설정한 뒤 실행합니다.
 

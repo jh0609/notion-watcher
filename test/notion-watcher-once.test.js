@@ -7,7 +7,7 @@ const path = require('path');
 const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
-  canonicalizeNotionProductUrl, runOnce
+  canonicalizeNotionProductUrl, resolveDebugConfig, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -24,6 +24,13 @@ async function config() {
 const product = (overrides = {}) => ({
   url: 'https://example.test/p/1', name: '상품 A', price: '10,000 원', status: 'FOR SALE',
   characters: [{ name: '캐릭터 B', status: '품절' }, { name: '캐릭터 A', status: '판매 중' }], ...overrides
+});
+
+test('debug:cards 스크린샷 저장은 기본적으로 비활성화되고 명시적으로만 활성화된다', () => {
+  const base = { NOTION_PAGE_URL: 'https://shop.notion.site/catalog' };
+  assert.equal(resolveDebugConfig(base).debugSaveScreenshots, false);
+  assert.equal(resolveDebugConfig({ ...base, DEBUG_SAVE_SCREENSHOTS: 'true' }).debugSaveScreenshots, true);
+  assert.equal(resolveDebugConfig({ ...base, DEBUG_SAVE_SCREENSHOTS: 'false' }).debugSaveScreenshots, false);
 });
 
 test('상품과 캐릭터 DOM 순서가 달라도 직렬화 JSON과 해시는 안정적이다', () => {
