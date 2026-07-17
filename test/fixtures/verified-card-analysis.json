@@ -1,0 +1,12 @@
+{
+  "source": "debug/detail-requirement-classification.json",
+  "analyzedProductCount": 34,
+  "unknownPageIds": [
+    "39f3f4a9f6268046b716ee5e88e71956"
+  ],
+  "verifiedHiddenProducts": [
+    { "name": "팝업 스토어 캐릭터 아크릴 스탠드", "visibleVariantCount": 6, "totalVariantCount": 8 },
+    { "name": "팝업 스토어 SD 아크릴 미니픽", "visibleVariantCount": 6, "totalVariantCount": 8 },
+    { "name": "팝업 스토어 캐릭터 도트 디폼블럭", "visibleVariantCount": 6, "totalVariantCount": 8 }
+  ]
+}

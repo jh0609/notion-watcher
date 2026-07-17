@@ -65,8 +65,9 @@ DETAIL_BLOCK_HEAVY_RESOURCES=true
 DETAIL_SERVICE_WORKERS=block
 DETAIL_HYDRATION_BACKOFF_MS=50000
 DETAIL_HYDRATION_MAX_RETRIES=1
+DETAIL_SESSION_RECOVERY_MAX_RETRIES=2
 DETAIL_RECHECK_INTERVAL_MS=21600000
-DETAIL_FULL_SCAN_INTERVAL_MS=21600000
+DETAIL_FULL_SCAN_INTERVAL_MS=86400000
 MAIN_TO_DETAIL_DELAY_MS=10000
 DEBUG_DOM=false
 DEBUG_DIR=./debug
@@ -87,9 +88,11 @@ OPERATOR_NTFY_TOPIC=
 
 상세 조회는 하나의 전용 BrowserContext를 공유하고 기본적으로 worker별 page를 재사용합니다. `DETAIL_REUSE_PAGES=false`이면 context만 공유하고 상품마다 새 page를 만듭니다. 기본적으로 `image`, `media`, `font`만 차단하며 document, script, XHR, fetch, stylesheet는 항상 허용합니다. `DETAIL_BLOCK_HEAVY_RESOURCES=false`이면 이미지·미디어·폰트도 허용합니다. `DETAIL_SERVICE_WORKERS=block|allow`로 Service Worker 정책을 비교할 수 있습니다. Navigation timeout은 `DETAIL_NAVIGATION_TIMEOUT_MS=20000`, 준비 timeout은 `DETAIL_READY_TIMEOUT_MS=10000`, 상품 하나의 cleanup 포함 hard timeout은 `DETAIL_HARD_TIMEOUT_MS=35000`이 기본값입니다.
 
-상세 ready는 `DETAIL_READY_POLL_INTERVAL_MS`(기본 `250`) 간격으로 UUID 일치와 본문 20자 이상만 확인합니다. 카드 해시가 유지된 상품은 이전 전체 옵션을 재사용하며, `DETAIL_RECHECK_INTERVAL_MS` 및 `DETAIL_FULL_SCAN_INTERVAL_MS`의 기본값인 6시간마다 상세 검증합니다.
+상세 ready는 `DETAIL_READY_POLL_INTERVAL_MS`(기본 `250`) 간격으로 UUID 일치와 본문 20자 이상만 확인합니다. 카드 파싱이 완전하고 노출 옵션이 6개 미만인 상품은 카드만 사용합니다. 옵션 6개 이상, 이전 숨김 옵션 이력, 분석 `UNKNOWN`, 카드 파싱 불완전 상품은 상세 조회하며 `DETAIL_FULL_SCAN_INTERVAL_MS`의 기본값인 24시간마다 전체 상세 검증합니다.
 
 메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `10000`)만큼 기다린 다음 별도의 상세 browser/context를 생성합니다. 첫 URL preflight가 hydration stall이면 그 세션을 완전히 종료하고 `DETAIL_HYDRATION_BACKOFF_MS`(기본 `50000`) 후 새 세션으로 재시도합니다. 재시도 횟수는 `DETAIL_HYDRATION_MAX_RETRIES`(기본 `1`)로 제한하며, 성공한 preflight 결과는 첫 상품 결과로 재사용합니다.
+
+상세 순회 중 연속 hydration stall 2회가 발생하면 circuit breaker가 세션을 재생성하고 최초 실패 상품부터 재개합니다. 실행당 세션 복구 횟수는 `DETAIL_SESSION_RECOVERY_MAX_RETRIES`(기본 `2`)로 제한하며, 초과 시 남은 상품을 조회하지 않고 전체 실행을 실패 처리합니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 

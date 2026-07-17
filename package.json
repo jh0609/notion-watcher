@@ -12,6 +12,7 @@
     "debug:transition": "node notion-watcher-once.js --debug-transition",
     "test:transition": "node notion-watcher-once.js --debug-transition",
     "benchmark:transition": "node notion-watcher-once.js --benchmark-transition",
+    "analyze:card-detail": "node notion-watcher-once.js --analyze-card-detail",
     "check": "node --check notion-watcher-once.js",
     "test": "node --test"
   },

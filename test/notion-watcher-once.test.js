@@ -6,11 +6,11 @@ const os = require('os');
 const path = require('path');
 const test = require('node:test');
 const {
-  normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
+  normalizeCatalog, serializeCatalog, diffCatalog, createHash, evaluateProductUrlCandidate,
   canonicalizeNotionProductUrl, resolveCardProductUrl, resolveConfig, resolveDebugConfig, waitForProductCards,
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
   processDetailPage, createDetailPageSlot, buildDetailContextSettings, parseProductCard, buildHybridDetailPlan,
-  isUsableDetailSnapshot, runOnce
+  isUsableDetailSnapshot, shouldTripHydrationCircuitBreaker, advanceHydrationCircuitState, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -47,14 +47,29 @@ test('상품과 캐릭터 DOM 순서가 달라도 직렬화 JSON과 해시는 �
 });
 
 test('상세 옵션 8개 중 카드에 6개가 노출된 상품은 requiresDetail=true다', () => {
-  const variants = ['가', '나', '다', '라', '마', '바'].map((name) => `${name} (판매 중)`).join(' ');
+  const variantRows = ['가', '나', '다', '라', '마', '바'].map((name) => `${name} (판매 중)`);
   const card = parseProductCard({
-    innerText: `도트 디폼블럭 12,000원 일부 상품 품절 ${variants} +2개`,
+    innerText: `도트 디폼블럭\n12,000원\n일부 상품 품절\n${variantRows.join('\n')}\n+2개`,
+    optionRowTexts: variantRows,
     hrefs: ['/5273f4a9f62683e5b87581c092c3aff2?pvs=25'], blockId: '', pageId: ''
   }, 'https://shop.notion.site/catalog');
   assert.equal(card.visibleVariantCount, 6);
   assert.equal(card.totalVariantCount, 8);
   assert.equal(card.requiresDetail, true);
+});
+
+test('포인트 키캡 카드에서 일시 품절 옵션 두 개를 전체 상태와 구분한다', () => {
+  const card = parseProductCard({
+    innerText: '포인트 키캡\n49,000원\n일시 품절\n김준호 （일시\u00a0품절）\n정예슬 (일시  품절)',
+    optionRowTexts: ['김준호 （일시\u00a0품절）', '정예슬 (일시  품절)'],
+    hrefs: ['/3973f4a9f62680f699e4e6fb8d3d56bb'], blockId: '', pageId: ''
+  }, 'https://shop.notion.site/catalog');
+  assert.equal(card.status, '일시 품절');
+  assert.equal(card.visibleVariantCount, 2);
+  assert.deepEqual(card.characters, [
+    { name: '김준호', status: 'temporarily_sold_out' },
+    { name: '정예슬', status: 'temporarily_sold_out' }
+  ]);
 });
 
 test('UUID가 일치하고 본문이 20자 이상이면 readyState와 무관하게 usable하다', () => {
@@ -66,7 +81,8 @@ test('UUID가 일치하고 본문이 20자 이상이면 readyState와 무관하�
 test('변경 없는 작은 카드는 6시간 전까지 이전 상세 옵션을 재사용한다', () => {
   const mainUrl = 'https://shop.notion.site/catalog';
   const candidate = {
-    innerText: '상품 A 10,000원 판매 중 가 (판매 중)',
+    innerText: '상품 A\n10,000원\n판매 중\n가 (판매 중)',
+    optionRowTexts: ['가 (판매 중)'],
     hrefs: ['/5273f4a9f62683e5b87581c092c3aff2'], blockId: '', pageId: ''
   };
   const card = parseProductCard(candidate, mainUrl);
@@ -84,6 +100,66 @@ test('변경 없는 작은 카드는 6시간 전까지 이전 상세 옵션을 �
       notionPageUrl: mainUrl, detailFullScanIntervalMs: 21_600_000, detailRecheckIntervalMs: 21_600_000
     });
   assert.deepEqual(plan.detailUrls, []);
+});
+
+function hybridPlanForCandidate(candidate, previousState = null) {
+  const mainUrl = 'https://shop.notion.site/catalog';
+  const card = parseProductCard(candidate, mainUrl);
+  return buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState,
+    new Date('2026-07-17T01:00:00.000Z'), {
+      notionPageUrl: mainUrl, detailFullScanIntervalMs: 86_400_000
+    });
+}
+
+test('포인트 키캡 visible=2이고 파싱이 완전하면 최초 실행에서도 상세를 생략한다', () => {
+  const candidate = {
+    innerText: '포인트 키캡\n49,000원\n일시 품절\n김준호 (일시 품절)\n정예슬 (일시 품절)',
+    optionRowTexts: ['김준호 (일시 품절)', '정예슬 (일시 품절)'],
+    hrefs: ['/3973f4a9f62680f699e4e6fb8d3d56bb'], blockId: '', pageId: ''
+  };
+  assert.deepEqual(hybridPlanForCandidate(candidate).detailUrls, []);
+});
+
+for (const name of ['팝업 스토어 캐릭터 아크릴 스탠드', '팝업 스토어 SD 아크릴 미니픽',
+  '팝업 스토어 캐릭터 도트 디폼블럭', '엠블럼 메탈 뱃지']) {
+  test(`${name} visible=6이면 상세 조회 대상으로 둔다`, () => {
+    const rows = ['가', '나', '다', '라', '마', '바'].map((value) => `${value} (판매 중)`);
+    const candidate = {
+      innerText: `${name}\n19,000원\n판매 중\n${rows.join('\n')}`, optionRowTexts: rows,
+      hrefs: [`/${createHash(name).slice(0, 32)}`], blockId: '', pageId: ''
+    };
+    const plan = hybridPlanForCandidate(candidate);
+    assert.equal(plan.detailReasonByUrl[plan.detailUrls[0]], 'visible-limit-reached');
+  });
+}
+
+test('이전 totalVariantCount가 현재 visibleVariantCount보다 크면 상세 조회한다', () => {
+  const candidate = {
+    innerText: '상품 A\n10,000원\n판매 중\n가 (판매 중)', optionRowTexts: ['가 (판매 중)'],
+    hrefs: ['/5273f4a9f62683e5b87581c092c3aff2'], blockId: '', pageId: ''
+  };
+  const card = parseProductCard(candidate, 'https://shop.notion.site/catalog');
+  const previous = { lastFullDetailScanAt: '2026-07-17T00:00:00.000Z', productMetadata: {
+    [card.url]: { totalVariantCount: 2, visibleVariantCount: 1, knownHiddenVariants: true }
+  }, catalog: { products: [] } };
+  const plan = hybridPlanForCandidate(candidate, previous);
+  assert.equal(plan.detailReasonByUrl[card.url], 'known-hidden-variants');
+});
+
+test('분석 UNKNOWN 상품은 상세 조회 대상으로 유지한다', () => {
+  const candidate = {
+    innerText: '로맨스 판타지 캐릭터 아크릴 스탠드\n19,000원\n판매 중', optionRowTexts: [],
+    hrefs: ['/39f3f4a9f6268046b716ee5e88e71956'], blockId: '', pageId: ''
+  };
+  const plan = hybridPlanForCandidate(candidate);
+  assert.equal(plan.detailReasonByUrl[plan.detailUrls[0]], 'unknown-analysis');
+});
+
+test('신규 상품의 카드 필수 필드가 누락되면 상세 조회한다', () => {
+  const candidate = { innerText: '신규 상품', optionRowTexts: [],
+    hrefs: ['/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], blockId: '', pageId: '' };
+  const plan = hybridPlanForCandidate(candidate);
+  assert.equal(plan.detailReasonByUrl[plan.detailUrls[0]], 'card-parse-incomplete');
 });
 
 test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff한다', () => {
@@ -180,11 +256,90 @@ test('운영 페이지 진단은 일반 노이즈를 제외하되 Notion API 오
     failure: () => ({ errorText: 'net::ERR_FAILED' })
   });
   handlers.pageerror(new Error('important Notion renderer failure'));
-  assert.equal(diagnostics.entries.length, 3);
-  assert.match(diagnostics.entries[0].message, /getSubscriptionBanner/);
-  assert.match(diagnostics.entries[1].message, /loadPageChunk/);
-  assert.match(diagnostics.entries[1].message, /resourceType=unknown/);
-  assert.match(diagnostics.entries[2].message, /renderer failure/);
+  assert.equal(diagnostics.entries.length, 4);
+  assert.equal(diagnostics.entries[0].ignored, true);
+  assert.match(diagnostics.entries[1].message, /getSubscriptionBanner/);
+  assert.match(diagnostics.entries[2].message, /loadPageChunk/);
+  assert.match(diagnostics.entries[2].message, /resourceType=unknown/);
+  assert.match(diagnostics.entries[3].message, /renderer failure/);
+});
+
+function createStatsigDetailPage(bodyTextLength) {
+  const handlers = {};
+  const pageUrl = 'https://example.test/5273f4a9f62683e5b87581c092c3aff2';
+  return {
+    handlers,
+    on: (event, handler) => { handlers[event] = handler; },
+    setDefaultNavigationTimeout: () => undefined,
+    setDefaultTimeout: () => undefined,
+    goto: async () => undefined,
+    url: () => pageUrl,
+    waitForTimeout: async () => undefined,
+    evaluate: async (fn) => fn.toString().includes('documentReadyState')
+      ? { expectedPageIdMatched: true, documentReadyState: 'interactive', bodyTextLength }
+      : { title: '상품 A', text: '상품 A 10,000원 판매 중', rowTexts: [] },
+    isClosed: () => false,
+    close: async () => undefined
+  };
+}
+
+test('Statsig console error가 있어도 정상 본문과 parse 결과면 성공한다', async () => {
+  const page = createStatsigDetailPage(187);
+  const promise = processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 1000, detailReadyTimeoutMs: 100, detailReadyPollIntervalMs: 10, detailHardTimeoutMs: 1000
+  }, 'statsig-console-test');
+  page.handlers.console({ type: () => 'error', text: () => '[Statsig] networking error during initialize' });
+  assert.equal((await promise).name, '상품 A');
+});
+
+test('Statsig request failure가 있어도 정상 parse 결과면 성공한다', async () => {
+  const page = createStatsigDetailPage(187);
+  const promise = processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 1000, detailReadyTimeoutMs: 100, detailReadyPollIntervalMs: 10, detailHardTimeoutMs: 1000
+  }, 'statsig-request-test');
+  page.handlers.requestfailed({
+    url: () => 'https://exp.notion.com/v1/initialize', resourceType: () => 'fetch',
+    failure: () => ({ errorText: 'net::ERR_FAILED' })
+  });
+  assert.equal((await promise).status, '판매 중');
+});
+
+test('Statsig 오류와 빈 본문이면 원인은 hydration stall이다', async () => {
+  const page = createStatsigDetailPage(0);
+  const promise = processDetailPage(page, page.url(), {
+    detailNavigationTimeoutMs: 1000, detailReadyTimeoutMs: 10, detailReadyPollIntervalMs: 1, detailHardTimeoutMs: 1000
+  }, 'statsig-hydration-test');
+  page.handlers.console({ type: () => 'error', text: () => '[Statsig] Failed to fetch' });
+  await assert.rejects(promise, (error) => error.reason === 'hydration stall' && !/statsig/i.test(error.message));
+});
+
+test('Statsig 오류만으로 circuit breaker가 발동하지 않고 hydration stall 두 번이면 발동한다', () => {
+  assert.equal(shouldTripHydrationCircuitBreaker(0), false);
+  assert.equal(shouldTripHydrationCircuitBreaker(1), false);
+  assert.equal(shouldTripHydrationCircuitBreaker(2), true);
+});
+
+test('세션별 hydration circuit breaker는 두 번 복구 후 세 번째 구간에서 중단한다', () => {
+  let state = { consecutiveStalls: 0, recoveries: 0 };
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  assert.equal(state.action, 'continue');
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  assert.equal(state.action, 'recover');
+  assert.equal(state.recoveries, 1);
+
+  state = advanceHydrationCircuitState(state, 'success', 2);
+  assert.equal(state.consecutiveStalls, 0);
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  assert.equal(state.action, 'recover');
+  assert.equal(state.recoveries, 2);
+
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  state = advanceHydrationCircuitState(state, 'hydration-stall', 2);
+  assert.equal(state.action, 'abort');
+  assert.equal(state.recoveries, 2);
+  const shouldFetchNextProduct = state.action !== 'abort';
+  assert.equal(shouldFetchNextProduct, false);
 });
 
 test('상세 리소스 차단은 image, media, font에만 적용한다', () => {

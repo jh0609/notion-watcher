@@ -20,7 +20,8 @@ const DEFAULT_DETAIL_HARD_TIMEOUT_MS = 35 * 1000;
 const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 10 * 1000;
 const DEFAULT_DETAIL_HYDRATION_BACKOFF_MS = 50 * 1000;
 const DEFAULT_DETAIL_HYDRATION_MAX_RETRIES = 1;
-const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES = 2;
+const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DETAIL_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
@@ -39,6 +40,9 @@ const BLOCKED_EXTERNAL_HOSTS = new Set([
 const EXTERNAL_SERVICE_TITLE_PATTERNS = [/\s\/\sX\s*$/i, /Instagram/i, /YouTube/i, /Facebook/i];
 
 const FALLBACK_CHROME_VERSION = '149.0.0.0';
+// Not an optimization allowlist: this analysis-failure marker only forces the
+// conservative detail path until the page has a verified comparison result.
+const ANALYSIS_UNKNOWN_PAGE_IDS = new Set(['39f3f4a9f6268046b716ee5e88e71956']);
 
 const COMMON_UI_PATTERNS = [
   /^notion$/i,
@@ -140,6 +144,7 @@ function resolveConfig(env = process.env) {
   const detailServiceWorkers = parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS);
   const detailHydrationBackoffMs = parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS);
   const detailHydrationMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES);
+  const detailSessionRecoveryMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_SESSION_RECOVERY_MAX_RETRIES', DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES);
   const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
   const detailRecheckIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_RECHECK_INTERVAL_MS', DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
 
@@ -176,6 +181,7 @@ function resolveConfig(env = process.env) {
     detailServiceWorkers,
     detailHydrationBackoffMs,
     detailHydrationMaxRetries,
+    detailSessionRecoveryMaxRetries,
     detailFullScanIntervalMs,
     detailRecheckIntervalMs,
     staleLockMs,
@@ -222,6 +228,7 @@ function resolveSingleDetailConfig(env = process.env) {
   if (!url) throw new Error('필수 환경변수가 누락되었습니다: DETAIL_DIAGNOSTIC_URL');
   return {
     url,
+    debugDom: true,
     detailNavigationTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_NAVIGATION_TIMEOUT_MS', DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS),
     detailReadyTimeoutMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_TIMEOUT_MS', DEFAULT_DETAIL_READY_TIMEOUT_MS),
     detailReadyPollIntervalMs: parsePositiveIntegerEnv(env, 'DETAIL_READY_POLL_INTERVAL_MS', DEFAULT_DETAIL_READY_POLL_INTERVAL_MS),
@@ -249,6 +256,7 @@ function resolveTransitionDiagnosticConfig(env = process.env) {
     detailServiceWorkers: parseDetailServiceWorkers(env.DETAIL_SERVICE_WORKERS),
     detailHydrationBackoffMs: parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS),
     detailHydrationMaxRetries: parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES),
+    detailSessionRecoveryMaxRetries: parseNonNegativeIntegerEnv(env, 'DETAIL_SESSION_RECOVERY_MAX_RETRIES', DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES),
     mainToDetailDelayMs: parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS)
   };
 }
@@ -578,7 +586,7 @@ const IGNORED_OPERATION_DIAGNOSTIC_PATTERNS = [
 
 function isIgnoredOperationDiagnostic(message) {
   // These are essential to diagnosing an empty Notion shell and must never be hidden.
-  if (/notion[^\s]*\/api\/v3\/|\/api\/v3\/|\/_assets\/.*(?:\.js|js\/)|\.js(?:[?#\s]|$)|resourceType=(?:script|xhr|fetch)/i.test(message)) return false;
+  if (/notion[^\s]*\/api\/v3\/|\/api\/v3\/|\/_assets\/.*(?:\.js|js\/)|\.js(?:[?#\s]|$)/i.test(message)) return false;
   return IGNORED_OPERATION_DIAGNOSTIC_PATTERNS.some((pattern) => pattern.test(message));
 }
 
@@ -586,8 +594,8 @@ function attachPageDiagnostics(page, label = 'main-page', options = {}) {
   const entries = [];
   const verbose = Boolean(options.verbose);
   const record = (level, message) => {
-    if (!verbose && isIgnoredOperationDiagnostic(message)) return;
-    const entry = { level, message };
+    const ignored = isIgnoredOperationDiagnostic(message);
+    const entry = { level, message, ignored };
     entries.push(entry);
     if (entries.length > 100) entries.shift();
     if (verbose) log(level, message);
@@ -611,7 +619,7 @@ function attachPageDiagnostics(page, label = 'main-page', options = {}) {
     entries,
     flush(limit = 30) {
       if (verbose) return;
-      entries.slice(-limit).forEach((entry) => log(entry.level, entry.message));
+      entries.filter((entry) => !entry.ignored).slice(-limit).forEach((entry) => log(entry.level, entry.message));
     }
   };
 }
@@ -1068,15 +1076,36 @@ function validateCatalog(catalog) {
 }
 
 function normalizeValue(value) {
-  return `${value || ''}`.replace(/\s+/g, ' ').trim();
+  return `${value || ''}`.normalize('NFKC').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function normalizeStatus(value) {
   const text = normalizeValue(value);
+  if (/일부\s*(?:상품\s*)?품절/i.test(text)) return 'partially_sold_out';
+  if (/일시\s*품절/i.test(text)) return 'temporarily_sold_out';
   if (/품절|sold\s*out|out\s*of\s*stock/i.test(text)) return 'sold_out';
   if (/판매\s*중|for\s*sale|in\s*stock|available/i.test(text)) return 'for_sale';
   if (/판매\s*종료|discontinued|closed/i.test(text)) return 'discontinued';
   return text.toLowerCase();
+}
+
+const CARD_OPTION_LINE_PATTERN = /^([^()（）\r\n]+?)\s*[\(（]\s*(일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)\s*[\)）]$/i;
+const CARD_STATUS_LINE_PATTERN = /^(일부\s*(?:상품\s*)?품절|일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)$/i;
+
+function parseCardVisibleVariants(text, optionRowTexts = []) {
+  const lines = `${text || ''}`.normalize('NFKC').replace(/\u00a0/g, ' ').split(/\r?\n/)
+    .map(normalizeValue).filter(Boolean);
+  const candidates = [...lines, ...(optionRowTexts || []).map(normalizeValue)];
+  const variants = [];
+  for (const candidate of candidates) {
+    const match = candidate.match(CARD_OPTION_LINE_PATTERN);
+    if (!match) continue;
+    if (CARD_STATUS_LINE_PATTERN.test(normalizeValue(match[1]))) continue;
+    if (/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d/i.test(match[1])) continue;
+    variants.push({ name: normalizeValue(match[1]), status: normalizeStatus(match[2]) });
+  }
+  return [...new Map(variants.map((variant) => [`${variant.name}\u0000${variant.status}`, variant])).values()]
+    .sort((a, b) => a.name.localeCompare(b.name, 'ko-KR') || a.status.localeCompare(b.status));
 }
 
 function normalizeProduct(product) {
@@ -1108,13 +1137,14 @@ function parseProductCard(candidate, mainUrl) {
   const resolved = resolveCardProductUrl(candidate, mainUrl);
   if (!resolved?.url) return null;
   const url = canonicalizeNotionProductUrl(resolved.url, mainUrl);
-  const rawText = normalizeValue(candidate.innerText);
+  const originalText = `${candidate.innerText || ''}`.normalize('NFKC').replace(/\u00a0/g, ' ');
+  const rawText = normalizeValue(originalText);
   const firstFieldIndex = rawText.search(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d|판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE/i);
   const cardTitle = normalizeValue(firstFieldIndex > 0 ? rawText.slice(0, firstFieldIndex) : '');
   const parsed = parseProductText(cardTitle, rawText, []);
-  const overallStatus = rawText.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i);
-  const variantText = overallStatus ? rawText.slice((overallStatus.index || 0) + overallStatus[0].length) : rawText;
-  const visibleVariants = normalizeProduct({ characters: parseProductText('', variantText, []).characters }).characters;
+  const lines = originalText.split(/\r?\n/).map(normalizeValue).filter(Boolean);
+  const statusLine = lines.find((line) => CARD_STATUS_LINE_PATTERN.test(line));
+  const visibleVariants = parseCardVisibleVariants(originalText, candidate.optionRowTexts || []);
   const visibleVariantCount = visibleVariants.length;
   const explicitTotal = [
     ...rawText.matchAll(/(?:총|전체)\s*(\d+)\s*(?:개|종)/gi),
@@ -1122,11 +1152,12 @@ function parseProductCard(candidate, mainUrl) {
   ].map((match) => Number.parseInt(match[1], 10)).filter(Number.isFinite);
   const hiddenCount = Number.parseInt(rawText.match(/(?:외|\+)\s*(\d+)\s*(?:개|종)?/i)?.[1] || '0', 10);
   const totalVariantCount = Math.max(visibleVariantCount, ...explicitTotal, visibleVariantCount + hiddenCount);
-  const cardIncomplete = !parsed.name || !parsed.price || !parsed.status;
+  const cardStatus = statusLine || parsed.status;
+  const cardIncomplete = !parsed.name || !parsed.price || !cardStatus;
   const requiresDetail = visibleVariantCount >= 6 || totalVariantCount > visibleVariantCount ||
     /일부\s*(?:상품\s*)?품절|일시\s*품절/i.test(rawText) || cardIncomplete;
   const stableCard = {
-    url, name: parsed.name, price: parsed.price, status: parsed.status,
+    url, name: parsed.name, price: parsed.price, status: cardStatus,
     characters: visibleVariants, visibleVariantCount, totalVariantCount, cardIncomplete
   };
   return { ...stableCard, cardHash: createHash(JSON.stringify(stableCard)), requiresDetail, rawText };
@@ -1140,25 +1171,30 @@ function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
   }
   const previousMetadata = previousState?.productMetadata || {};
   const previousProducts = new Map((previousState?.catalog?.products || []).map((product) => [product.url, product]));
-  const firstFullRun = !previousState || !Object.keys(previousMetadata).length;
+  const firstFullRun = !previousState;
   const lastFullScanAt = Date.parse(previousState?.lastFullDetailScanAt || '');
-  const fullScanDue = firstFullRun || !Number.isFinite(lastFullScanAt) ||
-    now.getTime() - lastFullScanAt >= (config.detailFullScanIntervalMs || DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
+  const fullScanDue = Boolean(previousState) && (!Number.isFinite(lastFullScanAt) ||
+    now.getTime() - lastFullScanAt >= (config.detailFullScanIntervalMs || DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS));
   const cards = discovery.urls.map((url) => cardsByUrl.get(url) || {
     url, name: '', price: '', status: '', characters: [], visibleVariantCount: 0,
     totalVariantCount: 0, cardIncomplete: true, requiresDetail: true,
     cardHash: createHash(JSON.stringify({ url, missing: true }))
   });
+  const detailReasonByUrl = {};
   const detailUrls = cards.filter((card) => {
     const previous = previousMetadata[card.url];
-    const lastChecked = Date.parse(previous?.lastDetailCheckedAt || '');
-    const stale = !Number.isFinite(lastChecked) || now.getTime() - lastChecked >=
-      (config.detailRecheckIntervalMs || DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
-    return firstFullRun || fullScanDue || card.cardIncomplete || card.requiresDetail ||
-      Number(previous?.totalVariantCount || 0) > card.visibleVariantCount ||
-      !previous || previous.cardHash !== card.cardHash || stale;
+    const pageId = extractNotionPageId(card.url, card.url);
+    let reason = '';
+    if (fullScanDue) reason = 'periodic-full-scan';
+    else if (card.cardIncomplete) reason = 'card-parse-incomplete';
+    else if (ANALYSIS_UNKNOWN_PAGE_IDS.has(pageId)) reason = 'unknown-analysis';
+    else if (previous?.knownHiddenVariants || Number(previous?.totalVariantCount || 0) > card.visibleVariantCount) {
+      reason = 'known-hidden-variants';
+    } else if (card.visibleVariantCount >= 6) reason = 'visible-limit-reached';
+    if (reason) detailReasonByUrl[card.url] = reason;
+    return Boolean(reason);
   }).map((card) => card.url);
-  return { cards, detailUrls, previousMetadata, previousProducts, firstFullRun, fullScanDue };
+  return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts, firstFullRun, fullScanDue };
 }
 
 function serializeCatalog(catalog) {
@@ -1567,6 +1603,25 @@ function isUsableDetailSnapshot(snapshot = {}) {
   return snapshot.expectedPageIdMatched === true && Number(snapshot.bodyTextLength) >= 20;
 }
 
+function isHydrationStallSnapshot(snapshot = {}) {
+  return snapshot.expectedPageIdMatched === true && Number(snapshot.bodyTextLength) < 20;
+}
+
+function shouldTripHydrationCircuitBreaker(count) {
+  return Number(count) >= 2;
+}
+
+function advanceHydrationCircuitState(state, outcome, maxRecoveries = DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES) {
+  const next = { consecutiveStalls: state?.consecutiveStalls || 0, recoveries: state?.recoveries || 0 };
+  if (outcome === 'success') return { ...next, consecutiveStalls: 0, action: 'continue' };
+  if (outcome !== 'hydration-stall') return { ...next, consecutiveStalls: 0, action: 'continue' };
+  next.consecutiveStalls += 1;
+  const observedStalls = next.consecutiveStalls;
+  if (!shouldTripHydrationCircuitBreaker(observedStalls)) return { ...next, observedStalls, action: 'continue' };
+  if (next.recoveries >= maxRecoveries) return { ...next, observedStalls, action: 'abort' };
+  return { consecutiveStalls: 0, recoveries: next.recoveries + 1, observedStalls, action: 'recover' };
+}
+
 async function processDetailPage(page, url, config, logPrefix) {
   const navigationTimeoutMs = config.detailNavigationTimeoutMs || DEFAULT_DETAIL_NAVIGATION_TIMEOUT_MS;
   const readyTimeoutMs = config.detailReadyTimeoutMs || DEFAULT_DETAIL_READY_TIMEOUT_MS;
@@ -1618,7 +1673,7 @@ async function processDetailPage(page, url, config, logPrefix) {
           log('WARN', `${logPrefix} ready 실패 진단: ${JSON.stringify(diagnostic)}`);
           log('WARN', `${logPrefix} ready 실패: ${error.name}: ${error.message} (설정 timeout=${readyTimeoutMs}ms, 실제=${Date.now() - readyStartedAt}ms)`);
           pageDiagnostics.flush(30);
-          if (diagnostic.documentReadyState === 'interactive' && diagnostic.bodyTextLength === 0) {
+          if (isHydrationStallSnapshot(diagnostic)) {
             if (config.detailAttemptIsLast) {
               const failedHtmlPath = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR, 'detail-page-failed.html');
               try {
@@ -1629,7 +1684,7 @@ async function processDetailPage(page, url, config, logPrefix) {
                 log('WARN', `마지막 상세 실패 HTML 저장 실패: ${saveError.message}`);
               }
             }
-            throw new PageFetchError('hydration stall', `readyState=interactive, bodyTextLength=0`);
+            throw new PageFetchError('hydration stall', `expectedPageIdMatched=true, bodyTextLength=${diagnostic.bodyTextLength}`);
           }
         }
       }
@@ -1686,10 +1741,10 @@ function parseProductText(title, text, rowTexts = []) {
   const name = clean(title).replace(/\s*[|–-]\s*Notion.*$/i, '');
   const normalizedText = clean(text);
   const price = normalizedText.match(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/)?.[0] || '';
-  const statusPattern = /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i;
+  const statusPattern = /일부\s*(?:상품\s*)?품절|일시\s*품절|판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i;
   const status = normalizedText.match(statusPattern)?.[0] || '';
   const characters = [];
-  const optionPattern = /([^|\n,()]{1,80}?)\s*\((판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\)/gi;
+  const optionPattern = /([^|\n,()]{1,80}?)\s*[\(（]\s*(일시\s*품절|판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\s*[\)）]/gi;
   let match;
   while ((match = optionPattern.exec(normalizedText))) characters.push({ name: clean(match[1]), status: clean(match[2]) });
   rowTexts.forEach((value) => {
@@ -1800,9 +1855,12 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       const previous = hybridPlan.previousMetadata[card.url];
       const previousProduct = hybridPlan.previousProducts.get(card.url);
       const detail = detailsByUrl.get(card.url);
-      const fullVariants = detail?.characters || previous?.fullVariants || card.characters;
-      if (!detail && previous?.fullVariants) reusedDetailCount += 1;
-      else if (!detail) cardOnlyCount += 1;
+      const detailVariants = detail ? sanitizeAnalysisVariants(detail.characters) : null;
+      const fullVariants = detailVariants || card.characters;
+      const totalVariantCount = detail ? detailVariants.length : card.visibleVariantCount;
+      const hiddenVariantCount = Math.max(0, totalVariantCount - card.visibleVariantCount);
+      const knownHiddenVariants = hiddenVariantCount > 0 || Boolean(previous?.knownHiddenVariants && !detail);
+      if (!detail) cardOnlyCount += 1;
       metadata[card.url] = {
         id: extractNotionPageId(card.url, card.url) || card.url,
         cardHash: card.cardHash,
@@ -1811,8 +1869,11 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
         status: normalizeStatus(card.status),
         visibleVariants: card.characters,
         visibleVariantCount: card.visibleVariantCount,
-        totalVariantCount: detail ? Math.max(card.totalVariantCount, detail.characters.length) : card.totalVariantCount,
-        requiresDetail: card.requiresDetail,
+        totalVariantCount,
+        hiddenVariantCount,
+        knownHiddenVariants,
+        cardParseComplete: !card.cardIncomplete,
+        detailReason: hybridPlan.detailReasonByUrl[card.url] || null,
         lastDetailCheckedAt: detail ? hybridNow.toISOString() : previous?.lastDetailCheckedAt || null,
         fullVariants: normalizeProduct({ characters: fullVariants }).characters
       };
@@ -1826,11 +1887,16 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     });
     const catalog = validateCatalog(normalizeCatalog(combined));
     catalog.productMetadata = metadata;
-    catalog.lastFullDetailScanAt = hybridPlan.fullScanDue ? hybridNow.toISOString() : config.previousState?.lastFullDetailScanAt || null;
+    catalog.lastFullDetailScanAt = (hybridPlan.firstFullRun || hybridPlan.fullScanDue)
+      ? hybridNow.toISOString() : config.previousState?.lastFullDetailScanAt || null;
+    const reasons = Object.values(hybridPlan.detailReasonByUrl);
     catalog.hybridSummary = {
       totalProducts: hybridPlan.cards.length,
       cardOnlyCount,
       reusedDetailCount,
+      visibleLimitDetailCount: reasons.filter((reason) => reason === 'visible-limit-reached').length,
+      knownHiddenDetailCount: reasons.filter((reason) => reason === 'known-hidden-variants').length,
+      unknownDetailCount: reasons.filter((reason) => reason === 'unknown-analysis').length,
       detailFetchCount: detailProducts.filter(Boolean).length,
       detailTargetCount: urls.length,
       detailSuccessCount: detailProducts.filter(Boolean).length,
@@ -1883,6 +1949,8 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     let consecutiveHydrationStalls = 0;
     let hydrationStallCount = 0;
     let hydrationRecoveryCount = 0;
+    const sessionRecoveryMaxRetries = config.detailSessionRecoveryMaxRetries ?? DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES;
+    let traversalAborted = false;
     const activePages = new Set();
     let downgradedToSerial = false;
     const firstWaveOutcomes = new Map();
@@ -1900,10 +1968,14 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       const workerId = workerIndex + 1;
       let pageSlot = createDetailPageSlot(detailContext);
       try {
-        while (retryQueue.length > 0 || cursor < urls.length || hydrationResumeQueue.length > 0) {
+        while (!traversalAborted && (retryQueue.length > 0 || cursor < urls.length || hydrationResumeQueue.length > 0)) {
           if (!retryQueue.length && cursor >= urls.length && hydrationResumeQueue.length) {
-            if (hydrationRecoveryCount >= hydrationMaxRetries) {
-              retryQueue.push(...hydrationResumeQueue.splice(0));
+            if (hydrationRecoveryCount >= sessionRecoveryMaxRetries) {
+              const pending = hydrationResumeQueue.splice(0);
+              pending.forEach((index) => failures.push({ url: urls[index], reason: 'hydration stall' }));
+              traversalAborted = true;
+              log('ERROR', `복구 한도 초과로 전체 상세 순회 중단: 실패 지점=${pending[0] + 1}/${urls.length}, 남은 상품=${pending.length}`);
+              break;
             } else {
             await pageSlot.discard();
             await closeDetailBrowserSession(detailSession);
@@ -1916,6 +1988,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
             retryQueue.push(...hydrationResumeQueue.splice(0));
             consecutiveHydrationStalls = 0;
             hydrationRecoveryCount += 1;
+            log('WARN', `상세 session 복구: ${hydrationRecoveryCount}/${sessionRecoveryMaxRetries}`);
             }
           }
           const index = retryQueue.length > 0 ? retryQueue.shift() : cursor++;
@@ -1986,10 +2059,20 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               if (hydrationStall) {
                 hydrationStallCount += 1;
                 consecutiveHydrationStalls += 1;
-                if (hydrationRecoveryCount >= hydrationMaxRetries) break;
+                log('WARN', `연속 hydration stall: ${consecutiveHydrationStalls}/2`);
                 if (!hydrationResumeQueue.includes(index)) hydrationResumeQueue.push(index);
                 deferredHydration = true;
-                if (consecutiveHydrationStalls >= 2) {
+                if (shouldTripHydrationCircuitBreaker(consecutiveHydrationStalls)) {
+                  if (hydrationRecoveryCount >= sessionRecoveryMaxRetries) {
+                    traversalAborted = true;
+                    deferredHydration = false;
+                    hydrationResumeQueue.filter((pendingIndex) => pendingIndex !== index)
+                      .forEach((pendingIndex) => failures.push({ url: urls[pendingIndex], reason: 'hydration stall' }));
+                    hydrationResumeQueue.length = 0;
+                    const remainingCount = retryQueue.length + (urls.length - cursor);
+                    log('ERROR', `복구 한도 초과로 전체 상세 순회 중단: 실패 지점=${position}/${urls.length}, 남은 상품=${remainingCount}`);
+                    break;
+                  }
                   await closeDetailBrowserSession(detailSession);
                   const backoffMs = config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS;
                   log('WARN', `연속 hydration stall ${consecutiveHydrationStalls}회 감지, 남은 순회를 중단하고 ${Math.round(backoffMs / 1000)}초 cooldown 후 실패 지점부터 재개합니다.`);
@@ -2000,6 +2083,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
                   retryQueue.unshift(...hydrationResumeQueue.splice(0));
                   consecutiveHydrationStalls = 0;
                   hydrationRecoveryCount += 1;
+                  log('WARN', `상세 session 복구: ${hydrationRecoveryCount}/${sessionRecoveryMaxRetries}`);
                 }
                 break;
               }
@@ -2019,6 +2103,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
           log('INFO', `상세 동시성 지표: 활성 page=${activePages.size}, bodyTextLength=0, 성공=false, reason=${reason}`);
             log('WARN', `상세 페이지 조회 ${position}/${urls.length} 실패: ${reason} (${(durationMs / 1000).toFixed(1)}초)`);
           }
+          if (traversalAborted) break;
         }
       } finally {
         const currentPage = pageSlot.current();
@@ -2139,6 +2224,248 @@ async function benchmarkMainToDetailTransition(baseConfig = resolveTransitionDia
   return results;
 }
 
+function resolveCardDetailAnalysisConfig(env = process.env) {
+  const notionPageUrl = env.NOTION_PAGE_URL || 'https://flaxen-catshark-648.notion.site/MD-3973f4a9f62680f39ddafca527725466';
+  return {
+    ...resolveTransitionDiagnosticConfig({ ...env, NOTION_PAGE_URL: notionPageUrl }),
+    notionPageUrl,
+    debugDom: false,
+    debugDir: env.DEBUG_DIR || DEFAULT_DEBUG_DIR,
+    detailConcurrency: 1,
+    detailReusePages: false
+  };
+}
+
+async function collectCardStructureAnalysis(page, mainUrl) {
+  const rows = await page.evaluate(() => [...document.querySelectorAll('.notion-collection-item')].map((card, index) => {
+    const descendants = [...card.querySelectorAll('*')];
+    const styleOf = (element) => getComputedStyle(element);
+    const count = (predicate) => descendants.filter(predicate).length;
+    const innerText = card.innerText || '';
+    const textContent = card.textContent || '';
+    const href = card.getAttribute('href') || card.querySelector('a[href]')?.getAttribute('href') || '';
+    const dataBlockId = card.getAttribute('data-block-id') || card.querySelector('[data-block-id]')?.getAttribute('data-block-id') || '';
+    const dataPageId = card.getAttribute('data-page-id') || card.querySelector('[data-page-id]')?.getAttribute('data-page-id') || '';
+    const normalize = (value) => `${value || ''}`.normalize('NFKC').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const optionPattern = /^([^()（）\r\n]+?)\s*[\(（]\s*(일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)\s*[\)）]$/i;
+    const statusPattern = /^(일부\s*(?:상품\s*)?품절|일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)$/i;
+    const isOption = (value) => {
+      const match = normalize(value).match(optionPattern);
+      return Boolean(match && !statusPattern.test(normalize(match[1])) &&
+        !/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d/i.test(match[1]));
+    };
+    const textNodes = [];
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) textNodes.push(walker.currentNode.textContent || '');
+    const optionRowCandidates = descendants.map((element) => element.textContent || '').filter(isOption);
+    const overflowElements = descendants.filter((element) => /hidden|clip/.test(`${styleOf(element).overflow} ${styleOf(element).overflowY}`));
+    const clamped = descendants.filter((element) => {
+      const style = styleOf(element);
+      return style.webkitLineClamp !== 'none' && style.webkitLineClamp !== '0' && style.webkitLineClamp !== '';
+    });
+    return {
+      index, href, dataBlockId, dataPageId, innerText, innerTextLines: innerText.split(/\r?\n/), textContent,
+      descendantTextNodes: textNodes,
+      optionRowCandidates,
+      optionLineMatches: innerText.split(/\r?\n/).map((line) => ({ line, normalized: normalize(line), matches: isOption(line) })),
+      childElementCount: descendants.length,
+      displayNoneCount: count((element) => styleOf(element).display === 'none'),
+      visibilityHiddenCount: count((element) => styleOf(element).visibility === 'hidden'),
+      ariaHiddenCount: count((element) => element.getAttribute('aria-hidden') === 'true'),
+      hiddenAttributeCount: count((element) => element.hasAttribute('hidden')),
+      overflowHiddenOrClipCount: overflowElements.length,
+      scrollHeightClientHeightDifference: card.scrollHeight - card.clientHeight,
+      textContentInnerTextDifferent: textContent.replace(/\s+/g, ' ').trim() !== innerText.replace(/\s+/g, ' ').trim(),
+      lineClampCount: clamped.length,
+      moreIndicator: /더\s*보기|more|\+\s*\d+|…|\.\.\./i.test(`${innerText}\n${textContent}`)
+    };
+  }));
+  return rows.map((row) => {
+    const candidate = {
+      innerText: row.innerText, hrefs: row.href ? [row.href] : [],
+      blockId: row.dataBlockId, pageId: row.dataPageId, optionRowTexts: row.optionRowCandidates
+    };
+    const card = parseProductCard(candidate, mainUrl);
+    const humanVisibleOptionTexts = new Set([
+      ...row.optionLineMatches.filter((item) => item.matches).map((item) => item.normalized),
+      ...row.optionRowCandidates.map(normalizeValue).filter((value) => CARD_OPTION_LINE_PATTERN.test(value))
+    ]);
+    return {
+      ...row,
+      id: card ? extractNotionPageId(card.url, card.url) : row.dataPageId || row.dataBlockId || '',
+      url: card?.url || '', name: card?.name || '', price: card?.price || '', status: card?.status || '',
+      visibleVariants: card?.characters || [], visibleVariantCount: card?.visibleVariantCount || 0,
+      humanVisibleOptionRowCount: humanVisibleOptionTexts.size,
+      cardHash: card?.cardHash || '', cardParseIncomplete: !card || card.cardIncomplete
+    };
+  });
+}
+
+function evaluateAnalysisRule(items, predicate) {
+  const result = { truePositive: 0, falsePositive: 0, trueNegative: 0, falseNegative: 0,
+    missedHiddenVariantCount: 0, unnecessaryDetailCount: 0, products: [] };
+  for (const item of items.filter((entry) => entry.detailSuccess)) {
+    const predictedNeedsDetail = Boolean(predicate(item));
+    const actualNeedsDetail = item.actualNeedsDetail;
+    const bucket = predictedNeedsDetail
+      ? (actualNeedsDetail ? 'truePositive' : 'falsePositive')
+      : (actualNeedsDetail ? 'falseNegative' : 'trueNegative');
+    result[bucket] += 1;
+    if (bucket === 'falseNegative') result.missedHiddenVariantCount += item.hiddenVariantCount;
+    if (bucket === 'falsePositive') result.unnecessaryDetailCount += 1;
+    result.products.push({ id: item.id, name: item.name, predictedNeedsDetail, actualNeedsDetail, outcome: bucket });
+  }
+  result.safe = result.falseNegative === 0;
+  return result;
+}
+
+function sanitizeAnalysisVariants(characters) {
+  const cleaned = (characters || []).map((variant) => ({
+    name: normalizeValue(variant.name).replace(/^내용\s*\d+\s*/i, '').replace(/\s*일시$/i, ''),
+    status: normalizeStatus(variant.status)
+  })).filter((variant) => variant.name && !/현황|가격|비어\s*있음|\d{1,3}(?:,\d{3})*\s*원/i.test(variant.name));
+  return [...new Map(cleaned.map((variant) => [`${variant.name}\u0000${variant.status}`, variant])).values()];
+}
+
+async function analyzeCardDetail(config = resolveCardDetailAnalysisConfig()) {
+  const { chromium } = require('playwright');
+  const debugDir = path.resolve(config.debugDir);
+  await fs.mkdir(debugDir, { recursive: true });
+  let browser = await chromium.launch(getChromiumLaunchOptions());
+  let context = await browser.newContext(getBrowserContextOptions(browser));
+  let page = await context.newPage();
+  let cards;
+  try {
+    await page.goto(config.notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
+    await waitForProductCards(page, config.collectionWaitMs);
+    cards = await collectCardStructureAnalysis(page, config.notionPageUrl);
+    if (!cards.length) throw new PageFetchError('analysis product cards not found');
+    await saveStateAtomic(path.join(debugDir, 'card-structure-analysis.json'), cards);
+    const pointKeycap = cards.find((card) => /포인트\s*키캡/.test(card.name) || /포인트\s*키캡/.test(card.innerText));
+    if (pointKeycap) {
+      await saveStateAtomic(path.join(debugDir, 'point-keycap-card-diagnostic.json'), {
+        pageId: pointKeycap.dataPageId,
+        href: pointKeycap.href,
+        dataBlockId: pointKeycap.dataBlockId,
+        innerText: pointKeycap.innerText,
+        innerTextLines: pointKeycap.innerTextLines,
+        textContent: pointKeycap.textContent,
+        descendantTextNodes: pointKeycap.descendantTextNodes,
+        optionLineMatches: pointKeycap.optionLineMatches,
+        optionRowCandidates: pointKeycap.optionRowCandidates,
+        visibleVariants: pointKeycap.visibleVariants,
+        visibleVariantCount: pointKeycap.visibleVariantCount
+      });
+    }
+  } finally {
+    await closePageSafely(page);
+    await context.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+  }
+
+  await sleep(config.mainToDetailDelayMs);
+  let session = await createDetailBrowserSession(config);
+  const comparisons = [];
+  let consecutiveStalls = 0;
+  let recoveries = 0;
+  try {
+    for (let index = 0; index < cards.length; index += 1) {
+      const card = cards[index];
+      let detail;
+      let failureReason = '';
+      const detailPage = await session.context.newPage();
+      try {
+        detail = await processDetailPage(detailPage, card.url, { ...config, detailAttemptIsLast: true },
+          `카드-상세 분석 ${index + 1}/${cards.length}`);
+        consecutiveStalls = 0;
+      } catch (error) {
+        const failure = createPageFetchError(error);
+        failureReason = failure.reason;
+        if (failure.reason === 'hydration stall') consecutiveStalls += 1;
+        else consecutiveStalls = 0;
+      } finally {
+        await closePageSafely(detailPage);
+      }
+      if (!detail && failureReason === 'hydration stall' && shouldTripHydrationCircuitBreaker(consecutiveStalls) &&
+          recoveries < (config.detailSessionRecoveryMaxRetries ?? DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES)) {
+        await closeDetailBrowserSession(session);
+        await sleep(config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS);
+        session = await createDetailBrowserSession(config);
+        recoveries += 1;
+        consecutiveStalls = 0;
+      }
+      const fullVariants = detail ? sanitizeAnalysisVariants(detail.characters) : [];
+      const visible = normalizeProduct({ characters: card.visibleVariants }).characters;
+      const prefix = visible.every((variant, variantIndex) =>
+        fullVariants[variantIndex]?.name === variant.name && fullVariants[variantIndex]?.status === variant.status);
+      const visibleSubset = visible.every((variant) => fullVariants.some((full) =>
+        full.name === variant.name && full.status === variant.status));
+      const hiddenVariantCount = detail ? fullVariants.length - visible.length : null;
+      const statusMatches = detail ? normalizeStatus(card.status) === normalizeStatus(detail.status) : null;
+      const priceMatches = detail ? normalizeValue(card.price).replace(/\s+/g, '') === normalizeValue(detail.price).replace(/\s+/g, '') : null;
+      const hiddenDomSignal = card.textContentInnerTextDifferent || card.displayNoneCount > 0 || card.visibilityHiddenCount > 0 ||
+        card.ariaHiddenCount > 0 || card.hiddenAttributeCount > 0 || card.overflowHiddenOrClipCount > 0 || card.lineClampCount > 0;
+      const actualNeedsDetail = Boolean(detail && (hiddenVariantCount > 0 || !statusMatches || !priceMatches || card.cardParseIncomplete));
+      comparisons.push({ ...card, detailSuccess: Boolean(detail), failureReason,
+        detail: detail ? { name: detail.name, price: detail.price, status: detail.status,
+          fullVariants, totalVariantCount: fullVariants.length, bodyText: detail.text } : null,
+        cardOptionRaw: card.optionLineMatches.filter((line) => line.matches).map((line) => line.line),
+        detailOptionRaw: fullVariants.map((variant) => `${variant.name} (${variant.status})`),
+        totalVariantCount: detail ? fullVariants.length : null, hiddenVariantCount,
+        visibleVariantsArePrefix: detail ? prefix : null, hasActuallyHiddenVariants: detail ? hiddenVariantCount > 0 : null,
+        visibleVariantsAreSubset: detail ? visibleSubset : null,
+        invariantViolations: detail ? [
+          ...(card.humanVisibleOptionRowCount !== card.visibleVariantCount ? ['human-visible-option-count-mismatch'] : []),
+          ...(!visibleSubset ? ['visible-variants-not-subset'] : []),
+          ...(hiddenVariantCount !== fullVariants.length - visible.length ? ['hidden-count-formula-mismatch'] : []),
+          ...(hiddenVariantCount < 0 ? ['negative-hidden-count'] : [])
+        ] : [],
+        statusMatches, priceMatches, hiddenDomSignal, actualNeedsDetail });
+    }
+  } finally {
+    await closeDetailBrowserSession(session);
+  }
+  await saveStateAtomic(path.join(debugDir, 'card-detail-comparison.json'), comparisons);
+
+  const rules = {
+    A_visible_under_6_card_sufficient: evaluateAnalysisRule(comparisons, (item) => item.visibleVariantCount >= 6),
+    B_visible_6_or_more_needs_detail: evaluateAnalysisRule(comparisons, (item) => item.visibleVariantCount >= 6),
+    C_text_content_diff_needs_detail: evaluateAnalysisRule(comparisons, (item) => item.textContentInnerTextDifferent),
+    D_hidden_dom_signal_needs_detail: evaluateAnalysisRule(comparisons, (item) => item.hiddenDomSignal),
+    E_partial_sold_out_needs_detail: evaluateAnalysisRule(comparisons, (item) => /일부\s*(?:상품\s*)?품절/i.test(item.innerText)),
+    F_no_variants_card_sufficient: evaluateAnalysisRule(comparisons, (item) => item.visibleVariantCount > 0)
+  };
+  const classifications = comparisons.map((item) => {
+    if (!item.detailSuccess) return { id: item.id, name: item.name, classification: 'UNKNOWN', reasons: [item.failureReason || 'detail-fetch-failed'] };
+    if (item.invariantViolations.length) return { id: item.id, name: item.name, classification: 'UNKNOWN', reasons: item.invariantViolations };
+    if (item.actualNeedsDetail) return { id: item.id, name: item.name, classification: 'REQUIRES_DETAIL', reasons: [
+      `visibleVariantCount=${item.visibleVariantCount}`, `totalVariantCount=${item.totalVariantCount}`,
+      `hiddenVariantCount=${item.hiddenVariantCount}`,
+      ...(!item.statusMatches ? ['card-detail-status-mismatch'] : []), ...(!item.priceMatches ? ['card-detail-price-mismatch'] : []),
+      ...(item.cardParseIncomplete ? ['card-parse-incomplete'] : [])
+    ] };
+    return { id: item.id, name: item.name, classification: 'SAFE_CARD_ONLY', reasons: ['card-and-detail-match', `totalVariantCount=${item.totalVariantCount}`] };
+  });
+  await saveStateAtomic(path.join(debugDir, 'detail-requirement-classification.json'), { rules, products: classifications });
+  const summary = {
+    totalProducts: cards.length,
+    safeCardOnly: classifications.filter((item) => item.classification === 'SAFE_CARD_ONLY').length,
+    requiresDetail: classifications.filter((item) => item.classification === 'REQUIRES_DETAIL').length,
+    unknown: classifications.filter((item) => item.classification === 'UNKNOWN').length,
+    productsWithHiddenVariants: comparisons.filter((item) => item.hasActuallyHiddenVariants).length,
+    visibleCount6FalseNegatives: rules.B_visible_6_or_more_needs_detail.falseNegative,
+    recommendedInitialDetailCount: classifications.filter((item) => item.classification !== 'SAFE_CARD_ONLY').length
+  };
+  comparisons.forEach((item) => log('INFO', `상품 비교표: ${JSON.stringify({
+    name: item.name, cardOptions: item.cardOptionRaw, visibleVariantCount: item.visibleVariantCount,
+    detailOptions: item.detailOptionRaw, totalVariantCount: item.totalVariantCount,
+    hiddenVariantCount: item.hiddenVariantCount,
+    classification: classifications.find((classified) => classified.id === item.id)?.classification
+  })}`));
+  log('INFO', `카드-상세 분석 요약: ${JSON.stringify(summary)}`);
+  return { summary, rules, classifications, comparisons };
+}
+
 async function debugCards(config = resolveDebugConfig()) {
   const { chromium } = require('playwright');
   const browser = await chromium.launch(getChromiumLaunchOptions());
@@ -2236,6 +2563,18 @@ async function runOnce(options = {}) {
     } catch (error) {
       const fetchError = createPageFetchError(error);
       await recordPageFetchFailure(config, deps, fetchError.reason);
+      if (!previousState && config.operatorNtfyTopic) {
+        try {
+          await deps.sendOperatorNotification(
+            config,
+            'Notion watcher 최초 기준 스캔 실패',
+            `전체 상세 조회가 불완전하여 신규 기준 state를 생성하지 않았습니다.\n실패 이유: ${fetchError.reason}`
+          );
+          log('INFO', '최초 기준 스캔 실패 관리자 알림을 전송했습니다.');
+        } catch (alertError) {
+          log('ERROR', `최초 기준 스캔 실패 관리자 알림 전송 실패: ${alertError.message}`);
+        }
+      }
       throw fetchError;
     }
     await recordPageFetchSuccess(config, deps);
@@ -2319,7 +2658,12 @@ async function saveStateWithLog(stateFile, state) {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--benchmark-transition')) {
+  if (process.argv.includes('--analyze-card-detail')) {
+    analyzeCardDetail().catch((error) => {
+      log('ERROR', error.message);
+      process.exitCode = 1;
+    });
+  } else if (process.argv.includes('--benchmark-transition')) {
     benchmarkMainToDetailTransition().catch((error) => {
       log('ERROR', error.message);
       process.exitCode = 1;
@@ -2397,6 +2741,9 @@ module.exports = {
   processDetailPage,
   collectDetailSnapshot,
   isUsableDetailSnapshot,
+  isHydrationStallSnapshot,
+  shouldTripHydrationCircuitBreaker,
+  advanceHydrationCircuitState,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
   benchmarkDetailMode,
@@ -2404,6 +2751,9 @@ module.exports = {
   diagnoseSingleDetail,
   diagnoseMainToDetailTransition,
   benchmarkMainToDetailTransition,
+  collectCardStructureAnalysis,
+  evaluateAnalysisRule,
+  analyzeCardDetail,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
