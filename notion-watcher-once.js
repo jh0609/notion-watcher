@@ -457,19 +457,51 @@ function getBrowserContextOptions(browser) {
   };
 }
 
-function attachPageDiagnostics(page, label = 'main-page') {
-  page.on('pageerror', (error) => log('ERROR', `[${label}] pageerror: ${error.message}`));
+const IGNORED_OPERATION_DIAGNOSTIC_PATTERNS = [
+  /exp\.notion\.com/i,
+  /statsig/i,
+  /amplitude/i,
+  /OPFS.*sqlite3_vfs|sqlite3_vfs.*OPFS/i,
+  /emojiData/i,
+  /getSubscriptionBanner.*401|401.*getSubscriptionBanner/i,
+  /google\.com\/(?:ccm|rmkt)\/collect/i,
+  /googleadservices\.com/i,
+  /cdn\.metadata\.io\/pixel/i
+];
+
+function isIgnoredOperationDiagnostic(message) {
+  return IGNORED_OPERATION_DIAGNOSTIC_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+function attachPageDiagnostics(page, label = 'main-page', options = {}) {
+  const entries = [];
+  const verbose = Boolean(options.verbose);
+  const record = (level, message) => {
+    if (!verbose && isIgnoredOperationDiagnostic(message)) return;
+    const entry = { level, message };
+    entries.push(entry);
+    if (entries.length > 100) entries.shift();
+    if (verbose) log(level, message);
+  };
+  page.on('pageerror', (error) => record('ERROR', `[${label}] pageerror: ${error.message}`));
   page.on('console', (message) => {
     if (message.type() === 'error' || message.type() === 'warning') {
-      log(message.type() === 'error' ? 'ERROR' : 'WARN', `[${label}] console ${message.type()}: ${message.text()}`);
+      record(message.type() === 'error' ? 'ERROR' : 'WARN', `[${label}] console ${message.type()}: ${message.text()}`);
     }
   });
   page.on('requestfailed', (request) => {
-    log('WARN', `[${label}] requestfailed: ${request.url()} (${request.failure()?.errorText || 'unknown error'})`);
+    record('WARN', `[${label}] requestfailed: ${request.url()} (${request.failure()?.errorText || 'unknown error'})`);
   });
   page.on('response', (response) => {
-    if (response.status() >= 400) log('WARN', `[${label}] HTTP ${response.status()}: ${response.url()}`);
+    if (response.status() >= 400) record('WARN', `[${label}] HTTP ${response.status()}: ${response.url()}`);
   });
+  return {
+    entries,
+    flush(limit = 30) {
+      if (verbose) return;
+      entries.slice(-limit).forEach((entry) => log(entry.level, entry.message));
+    }
+  };
 }
 
 async function extractVisiblePageText(page) {
@@ -1226,7 +1258,7 @@ async function collectProductUrls(page, mainUrl) {
     }
   }
 
-  diagnostics.forEach((item) => log('DEBUG', `product-url-candidate ${JSON.stringify(item)}`));
+  if (config.debugDom) diagnostics.forEach((item) => log('DEBUG', `product-url-candidate ${JSON.stringify(item)}`));
   if (clickDiagnosticMode) {
     clickResults.forEach((item) => log('DEBUG', `card-click-result ${JSON.stringify(item)}`));
     await saveStateAtomic(path.join(debugDir, 'card-click-results.json'), clickResults);
@@ -1271,20 +1303,24 @@ async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const context = await browser.newContext(getBrowserContextOptions(browser));
     let page;
+    let pageDiagnostics;
     try {
       page = await context.newPage();
-      attachPageDiagnostics(page, `main-page attempt ${attempt}/${maxAttempts}`);
-      log('INFO', 'request interception/resource blocking: disabled (script, xhr, fetch allowed)');
+      pageDiagnostics = attachPageDiagnostics(page, `main-page attempt ${attempt}/${maxAttempts}`, {
+        verbose: config.debugDom
+      });
+      if (config.debugDom) log('INFO', 'request interception/resource blocking: disabled (script, xhr, fetch allowed)');
       await page.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
       await waitForProductCards(page, config.collectionWaitMs);
       await page.waitForTimeout(config.extraWaitMs);
       const stats = await getCollectionRenderStats(page);
-      log('INFO', `상품 카드 수집 직전 DOM 통계: ${JSON.stringify(stats)}`);
+      if (config.debugDom) log('INFO', `상품 카드 수집 직전 DOM 통계: ${JSON.stringify(stats)}`);
       const result = await collectProductUrls(page, notionPageUrl, config);
       log('INFO', `메인 페이지 조회 ${attempt}/${maxAttempts} 성공`);
       return result;
     } catch (error) {
       lastError = createPageFetchError(error);
+      pageDiagnostics?.flush(30);
       const stats = page ? await getCollectionRenderStats(page).catch(() => ({})) : {};
       log('WARN', `메인 페이지 실패 본문 앞 1000자: ${JSON.stringify(stats.bodyTextPreview || '')}`);
       if (Object.keys(stats).length) log('WARN', `메인 페이지 실패 DOM 통계: ${JSON.stringify(stats)}`);
@@ -1359,7 +1395,7 @@ async function debugCards(config = resolveDebugConfig()) {
   try {
     const context = await browser.newContext(getBrowserContextOptions(browser));
     const page = await context.newPage();
-    attachPageDiagnostics(page, 'debug-cards');
+    attachPageDiagnostics(page, 'debug-cards', { verbose: true });
     log('INFO', 'request interception/resource blocking: disabled (script, xhr, fetch allowed)');
     await page.goto(config.notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
     await waitForProductCards(page, config.collectionWaitMs);

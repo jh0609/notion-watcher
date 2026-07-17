@@ -7,7 +7,8 @@ const path = require('path');
 const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
-  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards, runOnce
+  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards,
+  attachPageDiagnostics, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -125,6 +126,21 @@ test('상품 카드 대기는 collection item 자체와 최소 2개 조건을 �
   assert.equal(calls[0].options.timeout, 4321);
   assert.match(calls[1].callback, /length >= 2/);
   assert.equal(calls[1].options.timeout, 4321);
+});
+
+test('운영 페이지 진단은 노이즈를 제외하고 중요한 오류를 메모리에 보관한다', () => {
+  const handlers = {};
+  const diagnostics = attachPageDiagnostics({ on: (event, handler) => { handlers[event] = handler; } }, 'test');
+  handlers.console({ type: () => 'error', text: () => 'Statsig request failed' });
+  handlers.response({ status: () => 401, url: () => 'https://www.notion.so/api/v3/getSubscriptionBanner' });
+  handlers.requestfailed({
+    url: () => 'https://www.notion.so/api/v3/loadPageChunk',
+    failure: () => ({ errorText: 'net::ERR_FAILED' })
+  });
+  handlers.pageerror(new Error('important Notion renderer failure'));
+  assert.equal(diagnostics.entries.length, 2);
+  assert.match(diagnostics.entries[0].message, /loadPageChunk/);
+  assert.match(diagnostics.entries[1].message, /renderer failure/);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {
