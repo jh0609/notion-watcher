@@ -7,7 +7,7 @@ const path = require('path');
 const test = require('node:test');
 const {
   normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate,
-  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, runOnce
+  canonicalizeNotionProductUrl, resolveCardProductUrl, resolveDebugConfig, waitForProductCards, runOnce
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -111,6 +111,20 @@ test('카드 URL은 내부 href를 우선하고 없으면 data-block-id를 사�
     source: 'card-block-id'
   });
   assert.equal(resolveCardProductUrl({ hrefs: ['https://x.com/example'], blockId: '' }, main), null);
+});
+
+test('상품 카드 대기는 collection item 자체와 최소 2개 조건을 모두 사용한다', async () => {
+  const calls = [];
+  await waitForProductCards({
+    waitForSelector: async (selector, options) => calls.push({ type: 'selector', selector, options }),
+    waitForFunction: async (callback, argument, options) => {
+      calls.push({ type: 'function', argument, options, callback: callback.toString() });
+    }
+  }, 4321);
+  assert.equal(calls[0].selector, '.notion-collection-item');
+  assert.equal(calls[0].options.timeout, 4321);
+  assert.match(calls[1].callback, /length >= 2/);
+  assert.equal(calls[1].options.timeout, 4321);
 });
 
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {

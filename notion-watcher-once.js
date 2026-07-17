@@ -335,10 +335,7 @@ async function fetchNotionPageSnapshot(notionPageUrl, config = {}) {
       page.waitForTimeout(renderWaitMs)
     ]);
 
-    await page.waitForSelector('.notion-collection-item', {
-      state: 'attached',
-      timeout: collectionWaitMs
-    }).catch(() => null);
+    await waitForProductCards(page, collectionWaitMs);
 
     await page.waitForTimeout(extraWaitMs);
 
@@ -975,26 +972,8 @@ function diffCatalog(previousCatalog, currentCatalog) {
   return changes.sort((a, b) => a.url.localeCompare(b.url));
 }
 
-async function collectProductUrls(page, mainUrl) {
-  const config = arguments[2] || {};
-  const debugDir = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR);
-  const clickDiagnosticMode = Boolean(config.diagnosticMode);
-  if (config.debugDom) {
-    await fs.mkdir(debugDir, { recursive: true });
-    const oldDebugFiles = await fs.readdir(debugDir).catch(() => []);
-    await Promise.all(oldDebugFiles.filter((name) =>
-      /^(?:main-page\.(?:html|png)|card-(?:candidates|click-results)\.json|modal-\d+\.(?:html|png))$/.test(name)
-    ).map((name) => fs.unlink(path.join(debugDir, name)).catch(() => undefined)));
-    await fs.writeFile(path.join(debugDir, 'main-page.html'), await page.content(), 'utf8');
-    if (clickDiagnosticMode && config.debugSaveScreenshots) {
-      await saveDebugScreenshot(
-        () => page.screenshot({ path: path.join(debugDir, 'main-page.png'), fullPage: true }),
-        'main-page'
-      );
-    }
-  }
-
-  const candidates = await page.evaluate(() => {
+async function collectProductCardCandidates(page) {
+  return page.evaluate(() => {
     const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
     const pricePattern = /\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/i;
     const statusPattern = /판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i;
@@ -1024,7 +1003,6 @@ async function collectProductUrls(page, mainUrl) {
     }).filter((item) => item.text && (
       item.collectionItem || (item.hasProductText && item.hasImage && item.clickable && item.text.length <= 500)
     ));
-
     scored.sort((a, b) => b.score - a.score || a.element.getBoundingClientRect().top - b.element.getBoundingClientRect().top);
     const selected = [];
     for (const item of scored) {
@@ -1034,26 +1012,59 @@ async function collectProductUrls(page, mainUrl) {
     return selected.map((item, index) => {
       item.element.setAttribute('data-notion-watcher-card-id', `${index}`);
       return {
-        id: index,
-        score: item.score,
-        outerHTML: item.element.outerHTML.slice(0, 4000),
-        innerText: item.text,
-        role: item.role,
-        class: item.className,
-        blockId: item.element.getAttribute('data-block-id') || '',
-        pageId: item.element.getAttribute('data-page-id') || '',
-        pageUrl: location.href,
-        hrefs: [...new Set([
-          item.element.getAttribute('href') || '',
+        id: index, score: item.score, outerHTML: item.element.outerHTML.slice(0, 4000), innerText: item.text,
+        role: item.role, class: item.className, blockId: item.element.getAttribute('data-block-id') || '',
+        pageId: item.element.getAttribute('data-page-id') || '', pageUrl: location.href,
+        hrefs: [...new Set([item.element.getAttribute('href') || '',
           ...[...item.element.querySelectorAll('a[href]')].map((anchor) => anchor.getAttribute('href') || '')
         ].filter(Boolean))],
-        hasImage: item.hasImage,
-        hasProductText: item.hasProductText,
-        clickable: item.clickable,
-        galleryLike: item.galleryLike
+        hasImage: item.hasImage, hasProductText: item.hasProductText, clickable: item.clickable, galleryLike: item.galleryLike
       };
     });
   });
+}
+
+async function getCollectionRenderStats(page) {
+  return page.evaluate(() => ({
+    collectionItemCount: document.querySelectorAll('.notion-collection-item').length,
+    collectionItemAnchorCount: document.querySelectorAll('.notion-collection-item a[href]').length,
+    dataBlockIdCount: document.querySelectorAll('.notion-collection-item[data-block-id], .notion-collection-item [data-block-id]').length,
+    bodyTextLength: (document.body?.innerText || '').length,
+    currentUrl: location.href
+  }));
+}
+
+async function waitForProductCards(page, timeoutMs) {
+  try {
+    await page.waitForSelector('.notion-collection-item', { state: 'attached', timeout: timeoutMs });
+    await page.waitForFunction(() => document.querySelectorAll('.notion-collection-item').length >= 2, null, { timeout: timeoutMs });
+  } catch (error) {
+    const stats = await getCollectionRenderStats(page).catch(() => ({}));
+    throw new PageFetchError('product cards not rendered', `${error.message}; ${JSON.stringify(stats)}`);
+  }
+}
+
+async function collectProductUrls(page, mainUrl) {
+  const config = arguments[2] || {};
+  const debugDir = path.resolve(config.debugDir || DEFAULT_DEBUG_DIR);
+  const clickDiagnosticMode = Boolean(config.diagnosticMode);
+  if (config.debugDom) {
+    await fs.mkdir(debugDir, { recursive: true });
+    const oldDebugFiles = await fs.readdir(debugDir).catch(() => []);
+    await Promise.all(oldDebugFiles.filter((name) =>
+      /^(?:main-page\.(?:html|png)|card-(?:candidates|click-results)\.json|modal-\d+\.(?:html|png))$/.test(name)
+    ).map((name) => fs.unlink(path.join(debugDir, name)).catch(() => undefined)));
+    await fs.writeFile(path.join(debugDir, 'main-page.html'), await page.content(), 'utf8');
+    if (clickDiagnosticMode && config.debugSaveScreenshots) {
+      await saveDebugScreenshot(
+        () => page.screenshot({ path: path.join(debugDir, 'main-page.png'), fullPage: true }),
+        'main-page'
+      );
+    }
+  }
+
+  /* Candidate extraction is shared by operational and manual diagnostic modes. */
+  const candidates = await collectProductCardCandidates(page);
 
   if (config.debugDom) await saveStateAtomic(path.join(debugDir, 'card-candidates.json'), candidates);
   if (!candidates.length) {
@@ -1225,17 +1236,37 @@ async function extractProductDetail(page, url) {
   return { url, name: raw.name, price: raw.price, status: raw.status, characters: raw.characters };
 }
 
+async function discoverProductUrlsWithRetries(browser, notionPageUrl, config) {
+  const maxAttempts = config.pageFetchMaxAttempts || DEFAULT_PAGE_FETCH_MAX_ATTEMPTS;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const context = await browser.newContext({ locale: 'ko-KR' });
+    try {
+      const page = await context.newPage();
+      await page.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
+      await waitForProductCards(page, config.collectionWaitMs);
+      await page.waitForTimeout(config.extraWaitMs);
+      const stats = await getCollectionRenderStats(page);
+      log('INFO', `상품 카드 수집 직전 DOM 통계: ${JSON.stringify(stats)}`);
+      const result = await collectProductUrls(page, notionPageUrl, config);
+      log('INFO', `메인 페이지 조회 ${attempt}/${maxAttempts} 성공`);
+      return result;
+    } catch (error) {
+      lastError = createPageFetchError(error);
+      log('WARN', `메인 페이지 조회 ${attempt}/${maxAttempts} 실패: ${lastError.message}`);
+      if (attempt < maxAttempts) await sleep(getRetryDelayMs(config.pageFetchRetryDelaysMs, attempt));
+    } finally {
+      await context.close().catch(() => undefined);
+    }
+  }
+  throw lastError || new PageFetchError('main page fetch failed');
+}
+
 async function fetchProductCatalog(notionPageUrl, config = {}) {
   const { chromium } = require('playwright');
   const browser = await chromium.launch({ headless: true });
   try {
-    const mainContext = await browser.newContext({ locale: 'ko-KR' });
-    const mainPage = await mainContext.newPage();
-    await mainPage.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
-    await mainPage.waitForSelector('.notion-collection-item a[href], [data-block-id] a[href]', { timeout: config.collectionWaitMs }).catch(() => null);
-    await mainPage.waitForTimeout(config.extraWaitMs);
-    const { urls } = await collectProductUrls(mainPage, notionPageUrl, config);
-    await mainContext.close();
+    const { urls } = await discoverProductUrlsWithRetries(browser, notionPageUrl, config);
     if (!urls.length) throw new PageFetchError('product detail URLs not found');
 
     const products = new Array(urls.length);
@@ -1285,8 +1316,10 @@ async function debugCards(config = resolveDebugConfig()) {
     const context = await browser.newContext({ locale: 'ko-KR', viewport: { width: 1365, height: 900 } });
     const page = await context.newPage();
     await page.goto(config.notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
-    await page.waitForTimeout(config.collectionWaitMs).catch(() => null);
+    await waitForProductCards(page, config.collectionWaitMs);
     await page.waitForTimeout(config.extraWaitMs);
+    const stats = await getCollectionRenderStats(page);
+    log('INFO', `상품 카드 수집 직전 DOM 통계: ${JSON.stringify(stats)}`);
     const result = await collectProductUrls(page, config.notionPageUrl, {
       ...config,
       debugDom: true,
@@ -1478,9 +1511,13 @@ module.exports = {
   normalizeCatalog,
   serializeCatalog,
   diffCatalog,
+  collectProductCardCandidates,
+  getCollectionRenderStats,
+  waitForProductCards,
   collectProductUrls,
   extractProductDetail,
   fetchProductCatalog,
+  discoverProductUrlsWithRetries,
   debugCards,
   formatCatalogDiff,
   sendNtfyNotification,
