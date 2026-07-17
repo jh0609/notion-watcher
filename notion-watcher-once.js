@@ -21,6 +21,11 @@ const DEFAULT_EXTRA_WAIT_MS = 1500;
 const DEFAULT_PAGE_FETCH_MAX_ATTEMPTS = 3;
 const DEFAULT_PAGE_FETCH_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000];
 const OPERATOR_ALERT_FAILURE_THRESHOLD = 2;
+const MIN_PRODUCT_COUNT = 2;
+const BLOCKED_EXTERNAL_HOSTS = new Set([
+  'x.com', 'twitter.com', 'instagram.com', 'youtube.com', 'youtu.be', 'facebook.com'
+]);
+const EXTERNAL_SERVICE_TITLE_PATTERNS = [/\s\/\sX\s*$/i, /Instagram/i, /YouTube/i, /Facebook/i];
 
 const FALLBACK_CHROME_VERSION = '149.0.0.0';
 
@@ -782,6 +787,52 @@ function canonicalizeUrl(value, baseUrl) {
   }
 }
 
+function isHostOrSubdomain(hostname, domain) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
+
+function evaluateProductUrlCandidate(candidate, mainUrl) {
+  const href = normalizeValue(candidate?.href);
+  const innerText = normalizeValue(candidate?.innerText);
+  const result = { href, innerText, hostname: '', allowed: false, reason: '' };
+  if (!href) return { ...result, reason: 'missing href' };
+  if (href.startsWith('#')) return { ...result, reason: 'hash link' };
+  if (/^(?:mailto|tel|javascript):/i.test(href)) return { ...result, reason: 'unsupported scheme' };
+  let url;
+  let main;
+  try {
+    url = new URL(href, mainUrl);
+    main = new URL(mainUrl);
+  } catch {
+    return { ...result, reason: 'invalid URL' };
+  }
+  result.hostname = url.hostname.toLowerCase();
+  if (!/^https?:$/.test(url.protocol)) return { ...result, reason: 'unsupported scheme' };
+  if ([...BLOCKED_EXTERNAL_HOSTS].some((host) => isHostOrSubdomain(result.hostname, host))) {
+    return { ...result, reason: 'blocked external host' };
+  }
+  const sameHost = result.hostname === main.hostname.toLowerCase();
+  const notionInternal = isHostOrSubdomain(result.hostname, 'notion.so') || isHostOrSubdomain(result.hostname, 'notion.site');
+  if (!sameHost && !notionInternal) return { ...result, reason: 'external host' };
+  const normalizedUrl = canonicalizeUrl(url.href, mainUrl);
+  if (normalizedUrl === canonicalizeUrl(mainUrl, mainUrl)) return { ...result, reason: 'main page itself' };
+  return { ...result, href: normalizedUrl, allowed: true, reason: 'allowed Notion product page' };
+}
+
+function validateCatalog(catalog) {
+  if (!catalog || !Array.isArray(catalog.products)) throw new PageFetchError('invalid product catalog');
+  if (catalog.products.length < MIN_PRODUCT_COUNT) {
+    throw new PageFetchError('insufficient product count', `expected at least ${MIN_PRODUCT_COUNT}, got ${catalog.products.length}`);
+  }
+  for (const product of catalog.products) {
+    const title = normalizeValue(product.name);
+    if (EXTERNAL_SERVICE_TITLE_PATTERNS.some((pattern) => pattern.test(title))) {
+      throw new PageFetchError('external service title detected', `${title} (${product.url})`);
+    }
+  }
+  return catalog;
+}
+
 function normalizeValue(value) {
   return `${value || ''}`.replace(/\s+/g, ' ').trim();
 }
@@ -855,10 +906,58 @@ function diffCatalog(previousCatalog, currentCatalog) {
 }
 
 async function collectProductUrls(page, mainUrl) {
-  const hrefs = await page.evaluate(() => [...document.querySelectorAll(
-    '.notion-collection-item a[href], a.notion-collection-item[href], [data-block-id] a[href]'
-  )].map((anchor) => anchor.href));
-  return [...new Set(hrefs.map((href) => canonicalizeUrl(href, mainUrl)).filter((url) => url && url !== canonicalizeUrl(mainUrl, mainUrl)))];
+  const candidates = await page.evaluate(() => {
+    const selector = [
+      '.notion-collection-item',
+      '[role="link"][data-block-id]',
+      '[role="link"][data-page-id]',
+      '[data-page-id]',
+      '[data-block-id][tabindex="0"]'
+    ].join(', ');
+    return [...document.querySelectorAll(selector)].map((element, index) => {
+      const anchors = element.matches('a[href]') ? [element] : [...element.querySelectorAll('a[href]')];
+      return {
+        index,
+        hrefs: [...new Set([element.getAttribute('href') || '', ...anchors.map((anchor) => anchor.getAttribute('href') || '')])].filter(Boolean),
+        innerText: (element.innerText || element.textContent || '').trim(),
+        pageId: element.getAttribute('data-page-id') || '',
+        blockId: element.getAttribute('data-block-id') || '',
+        needsClick: !element.getAttribute('href')
+      };
+    });
+  });
+
+  const diagnostics = [];
+  for (const candidate of candidates) {
+    const hrefs = [...candidate.hrefs];
+    if (candidate.pageId) hrefs.push(`/${candidate.pageId.replace(/-/g, '')}`);
+    if (candidate.needsClick) {
+      const before = canonicalizeUrl(page.url(), mainUrl);
+      const locator = page.locator([
+        '.notion-collection-item', '[role="link"][data-block-id]', '[role="link"][data-page-id]',
+        '[data-page-id]', '[data-block-id][tabindex="0"]'
+      ].join(', ')).nth(candidate.index);
+      try {
+        await locator.click({ timeout: 3000 });
+        await page.waitForTimeout(300);
+        const after = canonicalizeUrl(page.url(), mainUrl);
+        if (after && after !== before) hrefs.push(after);
+        if (page.url() !== mainUrl) await page.goto(mainUrl, { waitUntil: 'domcontentloaded' });
+      } catch {
+        // The diagnostic below records the missing URL; another card is still inspected.
+      }
+    }
+    if (!hrefs.length) hrefs.push('');
+    hrefs.forEach((href) => {
+      const diagnostic = evaluateProductUrlCandidate({ href, innerText: candidate.innerText }, mainUrl);
+      diagnostics.push({ ...diagnostic, pageId: candidate.pageId, blockId: candidate.blockId });
+    });
+  }
+  diagnostics.forEach((item) => log('DEBUG', `product-url-candidate ${JSON.stringify(item)}`));
+  return {
+    urls: [...new Set(diagnostics.filter((item) => item.allowed).map((item) => item.href))],
+    diagnostics
+  };
 }
 
 async function extractProductDetail(page, url) {
@@ -866,7 +965,7 @@ async function extractProductDetail(page, url) {
     const clean = (value) => `${value || ''}`.replace(/\s+/g, ' ').trim();
     const title = clean(document.querySelector('h1, [contenteditable="true"][data-content-editable-leaf="true"]')?.textContent) || clean(document.title).replace(/\s*[|–-]\s*Notion.*$/i, '');
     const text = clean(document.querySelector('.notion-page-content, main, article')?.innerText || document.body.innerText);
-    const price = text.match(/(?:₩\s*)?\d{1,3}(?:,\d{3})*\s*원?|₩\s*\d[\d,]*/)?.[0] || '';
+    const price = text.match(/\d{1,3}(?:,\d{3})*\s*원|₩\s*\d[\d,]*/)?.[0] || '';
     const status = text.match(/판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK/i)?.[0] || '';
     const characters = [];
     const pattern = /([^|\n,()]{1,80}?)\s*\((판매\s*중|품절|SOLD\s*OUT|FOR\s*SALE|IN\s*STOCK|OUT\s*OF\s*STOCK)\)/gi;
@@ -883,6 +982,9 @@ async function extractProductDetail(page, url) {
   });
   assertNotionContentLooksUsable({ url: page.url(), title: raw.name, text: raw.text, renderedCandidateCount: 1 });
   if (!raw.name) throw new PageFetchError('product name not found');
+  if (EXTERNAL_SERVICE_TITLE_PATTERNS.some((pattern) => pattern.test(raw.name))) {
+    throw new PageFetchError('external service title detected', raw.name);
+  }
   return { url, name: raw.name, price: raw.price, status: raw.status, characters: raw.characters };
 }
 
@@ -895,7 +997,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     await mainPage.goto(notionPageUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeoutMs });
     await mainPage.waitForSelector('.notion-collection-item a[href], [data-block-id] a[href]', { timeout: config.collectionWaitMs }).catch(() => null);
     await mainPage.waitForTimeout(config.extraWaitMs);
-    const urls = await collectProductUrls(mainPage, notionPageUrl);
+    const { urls } = await collectProductUrls(mainPage, notionPageUrl);
     await mainContext.close();
     if (!urls.length) throw new PageFetchError('product detail URLs not found');
 
@@ -933,7 +1035,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       error.failures = failures;
       throw error;
     }
-    return normalizeCatalog(products);
+    return validateCatalog(normalizeCatalog(products));
   } finally {
     await browser.close().catch(() => undefined);
   }
@@ -997,7 +1099,7 @@ async function runOnce(options = {}) {
 
     let catalog;
     try {
-      catalog = normalizeCatalog(await deps.fetchCatalog(config.notionPageUrl, config));
+      catalog = validateCatalog(normalizeCatalog(await deps.fetchCatalog(config.notionPageUrl, config)));
     } catch (error) {
       const fetchError = createPageFetchError(error);
       await recordPageFetchFailure(config, deps, fetchError.reason);
@@ -1100,6 +1202,8 @@ module.exports = {
   formatKstDateTime,
   createTableDiff,
   canonicalizeUrl,
+  evaluateProductUrlCandidate,
+  validateCatalog,
   normalizeProduct,
   normalizeCatalog,
   serializeCatalog,
@@ -1114,6 +1218,7 @@ module.exports = {
   createDesktopUserAgent,
   DEFAULT_MIN_TEXT_LENGTH,
   DEFAULT_DETAIL_CONCURRENCY,
+  MIN_PRODUCT_COUNT,
   DEFAULT_STALE_LOCK_MS,
   DEFAULT_PAGE_LOAD_TIMEOUT_MS,
   DEFAULT_PAGE_TIMEOUT_MS: DEFAULT_PAGE_LOAD_TIMEOUT_MS,

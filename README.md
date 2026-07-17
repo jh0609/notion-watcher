@@ -13,6 +13,10 @@
 7. 변경이 없으면 `checkedAt`만 갱신합니다.
 8. 변경이 있으면 상품별 diff를 알리고 전체 JSON 스냅샷과 diff 파일을 저장합니다. 상세 페이지가 하나라도 최종 실패하면 전체 상태를 저장하지 않습니다.
 
+URL 후보는 메인 페이지와 같은 호스트 또는 `notion.so`/`notion.site` 내부 페이지만 허용합니다. X, Twitter, Instagram, YouTube, Facebook과 기타 외부 호스트, `mailto:`, `tel:`, `javascript:`, 해시 링크 및 메인 페이지 자체는 제외합니다. 각 후보의 링크 문구, 호스트, 판정과 제외 사유는 `DEBUG product-url-candidate` JSON 로그로 출력됩니다. 갤러리 카드에 `href`가 없으면 `role=link`, `data-page-id`, `data-block-id` 카드 구조와 클릭 후 이동 URL을 확인합니다.
+
+상품이 2개 미만이거나 외부 서비스 제목이 감지되거나 상세 페이지 하나라도 실패하면 최초 실행을 포함해 카탈로그 상태를 저장하지 않습니다.
+
 ## 설치
 
 Node.js 18 이상이 필요합니다.

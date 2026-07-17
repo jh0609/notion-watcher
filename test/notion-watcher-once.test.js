@@ -5,7 +5,9 @@ const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
 const test = require('node:test');
-const { normalizeCatalog, serializeCatalog, diffCatalog, runOnce } = require('../notion-watcher-once');
+const {
+  normalizeCatalog, serializeCatalog, diffCatalog, evaluateProductUrlCandidate, runOnce
+} = require('../notion-watcher-once');
 
 async function config() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'notion-watcher-test-'));
@@ -47,6 +49,34 @@ test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff
   assert.ok(changed.changes.some((item) => item.field === 'character_removed'));
 });
 
+test('외부 링크와 실제 Notion 상품 링크가 섞여 있어도 상품 링크만 허용한다', () => {
+  const main = 'https://shop.notion.site/catalog-abc';
+  const candidates = [
+    { href: 'https://shop.notion.site/product-one', innerText: '상품 1' },
+    { href: 'https://www.notion.so/product-two', innerText: '상품 2' },
+    { href: 'https://example.com/help', innerText: '도움말' },
+    { href: 'mailto:hello@example.com', innerText: '메일' },
+    { href: '#stock', innerText: '재고' },
+    { href: main, innerText: '현재 페이지' }
+  ].map((candidate) => evaluateProductUrlCandidate(candidate, main));
+  assert.deepEqual(candidates.filter((item) => item.allowed).map((item) => item.hostname), [
+    'shop.notion.site', 'www.notion.so'
+  ]);
+  assert.deepEqual(candidates.filter((item) => !item.allowed).map((item) => item.reason), [
+    'external host', 'unsupported scheme', 'hash link', 'main page itself'
+  ]);
+});
+
+test('X 링크는 상품 URL 후보에서 명시적으로 제거한다', () => {
+  const result = evaluateProductUrlCandidate(
+    { href: 'https://x.com/phoenixcolab', innerText: '불새재단연구소' },
+    'https://shop.notion.site/catalog'
+  );
+  assert.equal(result.allowed, false);
+  assert.equal(result.hostname, 'x.com');
+  assert.equal(result.reason, 'blocked external host');
+});
+
 test('부분 조회 실패 시 기존 상태를 저장하지 않는다', async () => {
   const cfg = await config();
   const previous = { hash: 'old', catalog: normalizeCatalog([product()]), checkedAt: 'old', changedAt: null };
@@ -63,7 +93,10 @@ test('변경 시 상태와 전체 스냅샷 및 diff 파일을 저장한다', as
   const cfg = await config();
   await fs.writeFile(cfg.stateFile, JSON.stringify({ hash: 'old', catalog: normalizeCatalog([product()]), checkedAt: 'old' }));
   let notification = '';
-  const current = normalizeCatalog([product({ status: '품절' })]);
+  const current = normalizeCatalog([
+    product({ status: '품절' }),
+    product({ url: 'https://example.test/p/2', name: '상품 B' })
+  ]);
   const exitCode = await runOnce({ config: cfg, deps: {
     fetchCatalog: async () => current,
     sendNotification: async (_config, _at, _before, _after, body) => { notification = body; },
@@ -73,4 +106,16 @@ test('변경 시 상태와 전체 스냅샷 및 diff 파일을 저장한다', as
   assert.match(notification, /상품 A/);
   assert.equal((await fs.readdir(cfg.snapshotDir)).length, 2);
   assert.deepEqual(JSON.parse(await fs.readFile(cfg.stateFile, 'utf8')).catalog, current);
+});
+
+test('상품이 1개만 추출되면 최초 실행에서도 상태 저장을 거부한다', async () => {
+  const cfg = await config();
+  const exitCode = await runOnce({ config: cfg, deps: {
+    fetchCatalog: async () => normalizeCatalog([product()]),
+    sendNotification: async () => { throw new Error('알림을 보내면 안 됩니다.'); },
+    sendOperatorNotification: async () => false,
+    now: () => new Date('2026-07-17T00:00:00Z')
+  } });
+  assert.equal(exitCode, 1);
+  await assert.rejects(fs.access(cfg.stateFile), { code: 'ENOENT' });
 });
