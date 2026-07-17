@@ -94,7 +94,9 @@ OPERATOR_NTFY_TOPIC=
 
 메인 URL 수집 browser는 page와 context를 닫은 뒤 완전히 종료합니다. `MAIN_TO_DETAIL_DELAY_MS`(기본 `10000`)만큼 기다린 다음 별도의 상세 browser/context를 생성합니다. 첫 URL preflight가 hydration stall이면 그 세션을 완전히 종료하고 `DETAIL_HYDRATION_BACKOFF_MS`(기본 `50000`) 후 새 세션으로 재시도합니다. 재시도 횟수는 `DETAIL_HYDRATION_MAX_RETRIES`(기본 `1`)로 제한하며, 성공한 preflight 결과는 첫 상품 결과로 재사용합니다.
 
-상세 순회 중 연속 hydration stall 2회가 발생하면 circuit breaker가 세션을 재생성하고 최초 실패 상품부터 재개합니다. 실행당 세션 복구 횟수는 `DETAIL_SESSION_RECOVERY_MAX_RETRIES`(기본 `2`)로 제한하며, 초과 시 남은 상품을 조회하지 않고 전체 실행을 실패 처리합니다.
+preflight를 포함해 한 상세 세션에서 `DETAIL_MAX_PAGES_PER_SESSION`개(기본 `2`)를 처리하면 browser/context를 완전히 닫고 `DETAIL_SESSION_ROTATION_DELAY_MS`(기본 `3000`) 후 다음 상품을 새 세션에서 처리합니다. 이는 정상 순환이며 hydration 복구 횟수에는 포함되지 않습니다.
+
+상세 순회 중 `DETAIL_CONSECUTIVE_STALL_THRESHOLD`회(기본 `1`) 연속 hydration stall이 발생하면 다음 상품을 같은 세션에서 시도하지 않고 browser/context를 폐기합니다. 기존 `DETAIL_HYDRATION_BACKOFF_MS` cooldown 후 실패 상품부터 새 세션에서 재개합니다. 실행당 세션 복구 횟수는 `DETAIL_SESSION_RECOVERY_MAX_RETRIES`(기본 `2`)로 제한하며, 초과 시 남은 상품을 조회하지 않고 전체 실행을 실패 처리합니다.
 
 `DEBUG_DOM=true`이면 카드 수집 시 `DEBUG_DIR` 아래에 다음 진단 파일을 저장합니다.
 

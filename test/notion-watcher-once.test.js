@@ -11,7 +11,7 @@ const {
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
   processDetailPage, createDetailPageSlot, buildDetailContextSettings, parseProductCard, buildHybridDetailPlan,
   isUsableDetailSnapshot, shouldTripHydrationCircuitBreaker, advanceHydrationCircuitState, runOnce,
-  validateCatalogMetadata, saveStateWithLog
+  validateCatalogMetadata, saveStateWithLog, shouldRotateDetailSession
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -410,11 +410,47 @@ test('상세 리소스와 Service Worker 정책은 환경변수로 비교할 수
   assert.equal(defaults.mainToDetailDelayMs, 10_000);
   assert.equal(defaults.detailHydrationBackoffMs, 50_000);
   assert.equal(defaults.detailHydrationMaxRetries, 1);
+  assert.equal(defaults.detailMaxPagesPerSession, 2);
+  assert.equal(defaults.detailSessionRotationDelayMs, 3_000);
+  assert.equal(defaults.detailConsecutiveStallThreshold, 1);
   const allowed = resolveConfig({
     ...base, DETAIL_BLOCK_HEAVY_RESOURCES: 'false', DETAIL_SERVICE_WORKERS: 'allow'
   });
   assert.equal(allowed.detailBlockHeavyResources, false);
   assert.equal(allowed.detailServiceWorkers, 'allow');
+});
+
+test('preflight를 포함해 상세 두 개 처리 후 정상 세션 순환한다', () => {
+  let processedInSession = 1;
+  assert.equal(shouldRotateDetailSession(processedInSession, 2), false);
+  processedInSession += 1;
+  assert.equal(shouldRotateDetailSession(processedInSession, 2), true);
+});
+
+test('hydration stall 한 번이면 다음 상품 전에 circuit breaker가 발동한다', () => {
+  assert.equal(shouldTripHydrationCircuitBreaker(1, 1), true);
+  assert.equal(shouldTripHydrationCircuitBreaker(0, 1), false);
+});
+
+test('stall 실패 상품은 새 세션 queue 선두에서 재개되고 5개가 중복·누락 없이 완료된다', () => {
+  const pending = [0, 1, 2, 3, 4];
+  const completed = [];
+  let stalledOnce = false;
+  let session = 1;
+  while (pending.length) {
+    const index = pending.shift();
+    if (index === 2 && !stalledOnce) {
+      stalledOnce = true;
+      session += 1;
+      pending.unshift(index);
+      assert.equal(pending[0], 2);
+      continue;
+    }
+    completed.push({ index, session });
+  }
+  assert.deepEqual(completed.map((item) => item.index), [0, 1, 2, 3, 4]);
+  assert.equal(new Set(completed.map((item) => item.index)).size, 5);
+  assert.equal(completed.find((item) => item.index === 2).session, 2);
 });
 
 test('test:transition과 debug:detail은 동일한 상세 context 설정 빌더를 사용한다', () => {

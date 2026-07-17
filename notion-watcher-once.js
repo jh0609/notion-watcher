@@ -21,6 +21,9 @@ const DEFAULT_MAIN_TO_DETAIL_DELAY_MS = 10 * 1000;
 const DEFAULT_DETAIL_HYDRATION_BACKOFF_MS = 50 * 1000;
 const DEFAULT_DETAIL_HYDRATION_MAX_RETRIES = 1;
 const DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES = 2;
+const DEFAULT_DETAIL_MAX_PAGES_PER_SESSION = 2;
+const DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS = 3 * 1000;
+const DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD = 1;
 const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DETAIL_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
@@ -145,6 +148,9 @@ function resolveConfig(env = process.env) {
   const detailHydrationBackoffMs = parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS);
   const detailHydrationMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES);
   const detailSessionRecoveryMaxRetries = parseNonNegativeIntegerEnv(env, 'DETAIL_SESSION_RECOVERY_MAX_RETRIES', DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES);
+  const detailMaxPagesPerSession = parsePositiveIntegerEnv(env, 'DETAIL_MAX_PAGES_PER_SESSION', DEFAULT_DETAIL_MAX_PAGES_PER_SESSION);
+  const detailSessionRotationDelayMs = parsePositiveIntegerEnv(env, 'DETAIL_SESSION_ROTATION_DELAY_MS', DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS);
+  const detailConsecutiveStallThreshold = parsePositiveIntegerEnv(env, 'DETAIL_CONSECUTIVE_STALL_THRESHOLD', DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD);
   const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
   const detailRecheckIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_RECHECK_INTERVAL_MS', DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
 
@@ -182,6 +188,9 @@ function resolveConfig(env = process.env) {
     detailHydrationBackoffMs,
     detailHydrationMaxRetries,
     detailSessionRecoveryMaxRetries,
+    detailMaxPagesPerSession,
+    detailSessionRotationDelayMs,
+    detailConsecutiveStallThreshold,
     detailFullScanIntervalMs,
     detailRecheckIntervalMs,
     staleLockMs,
@@ -257,6 +266,9 @@ function resolveTransitionDiagnosticConfig(env = process.env) {
     detailHydrationBackoffMs: parsePositiveIntegerEnv(env, 'DETAIL_HYDRATION_BACKOFF_MS', DEFAULT_DETAIL_HYDRATION_BACKOFF_MS),
     detailHydrationMaxRetries: parseNonNegativeIntegerEnv(env, 'DETAIL_HYDRATION_MAX_RETRIES', DEFAULT_DETAIL_HYDRATION_MAX_RETRIES),
     detailSessionRecoveryMaxRetries: parseNonNegativeIntegerEnv(env, 'DETAIL_SESSION_RECOVERY_MAX_RETRIES', DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES),
+    detailMaxPagesPerSession: parsePositiveIntegerEnv(env, 'DETAIL_MAX_PAGES_PER_SESSION', DEFAULT_DETAIL_MAX_PAGES_PER_SESSION),
+    detailSessionRotationDelayMs: parsePositiveIntegerEnv(env, 'DETAIL_SESSION_ROTATION_DELAY_MS', DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS),
+    detailConsecutiveStallThreshold: parsePositiveIntegerEnv(env, 'DETAIL_CONSECUTIVE_STALL_THRESHOLD', DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD),
     mainToDetailDelayMs: parsePositiveIntegerEnv(env, 'MAIN_TO_DETAIL_DELAY_MS', DEFAULT_MAIN_TO_DETAIL_DELAY_MS)
   };
 }
@@ -1662,8 +1674,12 @@ function isHydrationStallSnapshot(snapshot = {}) {
   return snapshot.expectedPageIdMatched === true && Number(snapshot.bodyTextLength) < 20;
 }
 
-function shouldTripHydrationCircuitBreaker(count) {
-  return Number(count) >= 2;
+function shouldTripHydrationCircuitBreaker(count, threshold = 2) {
+  return Number(count) >= Number(threshold);
+}
+
+function shouldRotateDetailSession(processedCount, maxPagesPerSession = DEFAULT_DETAIL_MAX_PAGES_PER_SESSION) {
+  return Number(processedCount) >= Number(maxPagesPerSession);
 }
 
 function advanceHydrationCircuitState(state, outcome, maxRecoveries = DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES) {
@@ -2019,6 +2035,12 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     let hydrationStallCount = 0;
     let hydrationRecoveryCount = 0;
     const sessionRecoveryMaxRetries = config.detailSessionRecoveryMaxRetries ?? DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES;
+    const maxPagesPerSession = config.detailMaxPagesPerSession || DEFAULT_DETAIL_MAX_PAGES_PER_SESSION;
+    const sessionRotationDelayMs = config.detailSessionRotationDelayMs || DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS;
+    const stallThreshold = config.detailConsecutiveStallThreshold || DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD;
+    // The successful preflight used the current browser/context and therefore
+    // consumes one slot from that session's bounded lifetime.
+    let sessionProcessedCount = 1;
     let traversalAborted = false;
     const activePages = new Set();
     let downgradedToSerial = false;
@@ -2038,6 +2060,19 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       let pageSlot = createDetailPageSlot(detailContext);
       try {
         while (!traversalAborted && (retryQueue.length > 0 || cursor < urls.length || hydrationResumeQueue.length > 0)) {
+          if (shouldRotateDetailSession(sessionProcessedCount, maxPagesPerSession)) {
+            log('INFO', `정상 세션 순환: ${sessionProcessedCount}개 처리 완료`);
+            const rotatingPage = pageSlot.current().page;
+            if (rotatingPage) activePages.delete(rotatingPage);
+            await pageSlot.discard();
+            await closeDetailBrowserSession(detailSession);
+            await sleep(sessionRotationDelayMs);
+            detailSession = await createDetailBrowserSession(config);
+            detailContext = detailSession.context;
+            pageSlot = createDetailPageSlot(detailContext);
+            sessionProcessedCount = 0;
+            consecutiveHydrationStalls = 0;
+          }
           if (!retryQueue.length && cursor >= urls.length && hydrationResumeQueue.length) {
             if (hydrationRecoveryCount >= sessionRecoveryMaxRetries) {
               const pending = hydrationResumeQueue.splice(0);
@@ -2056,6 +2091,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
             pageSlot = createDetailPageSlot(detailContext);
             retryQueue.push(...hydrationResumeQueue.splice(0));
             consecutiveHydrationStalls = 0;
+            sessionProcessedCount = 0;
             hydrationRecoveryCount += 1;
             log('WARN', `상세 session 복구: ${hydrationRecoveryCount}/${sessionRecoveryMaxRetries}`);
             }
@@ -2097,6 +2133,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               if (index <= 1 && detailConcurrency === 2) await firstWaveDone;
               lastError = null;
               consecutiveHydrationStalls = 0;
+              sessionProcessedCount += 1;
               const durationMs = Date.now() - productStartedAt;
               detailDurationsMs.push(durationMs);
               log('INFO', `상세 동시성 지표: 활성 page=${activePages.size}, bodyTextLength=${products[index].text.length}, 성공=true`);
@@ -2128,10 +2165,10 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               if (hydrationStall) {
                 hydrationStallCount += 1;
                 consecutiveHydrationStalls += 1;
-                log('WARN', `연속 hydration stall: ${consecutiveHydrationStalls}/2`);
+                log('WARN', `연속 hydration stall: ${consecutiveHydrationStalls}/${stallThreshold}`);
                 if (!hydrationResumeQueue.includes(index)) hydrationResumeQueue.push(index);
                 deferredHydration = true;
-                if (shouldTripHydrationCircuitBreaker(consecutiveHydrationStalls)) {
+                if (shouldTripHydrationCircuitBreaker(consecutiveHydrationStalls, stallThreshold)) {
                   if (hydrationRecoveryCount >= sessionRecoveryMaxRetries) {
                     traversalAborted = true;
                     deferredHydration = false;
@@ -2144,13 +2181,15 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
                   }
                   await closeDetailBrowserSession(detailSession);
                   const backoffMs = config.detailHydrationBackoffMs || DEFAULT_DETAIL_HYDRATION_BACKOFF_MS;
-                  log('WARN', `연속 hydration stall ${consecutiveHydrationStalls}회 감지, 남은 순회를 중단하고 ${Math.round(backoffMs / 1000)}초 cooldown 후 실패 지점부터 재개합니다.`);
+                  log('WARN', `hydration stall 세션 폐기: ${consecutiveHydrationStalls}회 감지`);
+                  log('WARN', `${Math.round(backoffMs / 1000)}초 cooldown 후 실패 상품부터 재개합니다.`);
                   await sleep(backoffMs);
                   detailSession = await createDetailBrowserSession(config);
                   detailContext = detailSession.context;
                   pageSlot = createDetailPageSlot(detailContext);
                   retryQueue.unshift(...hydrationResumeQueue.splice(0));
                   consecutiveHydrationStalls = 0;
+                  sessionProcessedCount = 0;
                   hydrationRecoveryCount += 1;
                   log('WARN', `상세 session 복구: ${hydrationRecoveryCount}/${sessionRecoveryMaxRetries}`);
                 }
@@ -2864,6 +2903,7 @@ module.exports = {
   isUsableDetailSnapshot,
   isHydrationStallSnapshot,
   shouldTripHydrationCircuitBreaker,
+  shouldRotateDetailSession,
   advanceHydrationCircuitState,
   fetchProductCatalog,
   discoverProductUrlsWithRetries,
