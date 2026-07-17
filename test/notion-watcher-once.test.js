@@ -694,6 +694,33 @@ test('변경 시 상태와 전체 스냅샷 및 diff 파일을 저장한다', as
   assert.deepEqual(JSON.parse(await fs.readFile(cfg.stateFile, 'utf8')).catalog, current);
 });
 
+test('저장 해시만 달라지고 상품 diff가 비어 있으면 공개 알림을 보내지 않는다', async () => {
+  const cfg = await config();
+  const previousCatalog = normalizeCatalog([
+    product(),
+    product({ url: 'https://example.test/22222222222222222222222222222222', name: '상품 B' })
+  ]);
+  await fs.writeFile(cfg.stateFile, JSON.stringify({
+    hash: 'metadata-only-old-hash',
+    catalog: previousCatalog,
+    checkedAt: 'old',
+    changedAt: '2026-07-16T00:00:00.000Z'
+  }));
+  let notificationCount = 0;
+  const exitCode = await runOnce({ config: cfg, deps: {
+    fetchCatalog: async () => previousCatalog,
+    sendNotification: async () => { notificationCount += 1; },
+    sendOperatorNotification: async () => false,
+    now: () => new Date('2026-07-17T00:00:00Z')
+  } });
+  const saved = JSON.parse(await fs.readFile(cfg.stateFile, 'utf8'));
+  assert.equal(exitCode, 0);
+  assert.equal(notificationCount, 0);
+  assert.notEqual(saved.hash, 'metadata-only-old-hash');
+  assert.equal(saved.changedAt, '2026-07-16T00:00:00.000Z');
+  await assert.rejects(fs.access(cfg.snapshotDir), { code: 'ENOENT' });
+});
+
 test('상품이 1개만 추출되면 최초 실행에서도 상태 저장을 거부한다', async () => {
   const cfg = await config();
   const exitCode = await runOnce({ config: cfg, deps: {
