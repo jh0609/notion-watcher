@@ -2,15 +2,15 @@ name: Remove automatic full detail scan
 
 on:
   push:
-    branches:
-      - fix/remove-automatic-full-scan
+    branches: [fix/remove-automatic-full-scan]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   update:
-    if: ${{ !contains(github.event.head_commit.message, '[full-scan-removed]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,59 +34,57 @@ jobs:
 
           main = Path('notion-watcher-once.js')
           text = main.read_text(encoding='utf-8')
-          original = text
 
-          replacements = [
-              ("const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;\n", ""),
-              ("  const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);\n", ""),
-              ("    detailFullScanIntervalMs,\n", ""),
+          exact = [
+              "const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;\n",
+              "  const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);\n",
+              "    detailFullScanIntervalMs,\n",
           ]
-          for old, new in replacements:
-              if old not in text:
-                  raise SystemExit(f'missing expected source fragment: {old!r}')
-              text = text.replace(old, new, 1)
+          for fragment in exact:
+              if fragment not in text:
+                  raise SystemExit(f'missing expected source fragment: {fragment!r}')
+              text = text.replace(fragment, '', 1)
 
-          old_plan = """  const firstFullRun = !previousState;
-          const lastFullScanAt = Date.parse(previousState?.lastFullDetailScanAt || '');
-          const fullScanDue = Boolean(previousState) && (!Number.isFinite(lastFullScanAt) ||
-            now.getTime() - lastFullScanAt >= (config.detailFullScanIntervalMs || DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS));
-          """
-          if old_plan not in text:
-              raise SystemExit('missing full-scan plan block')
-          text = text.replace(old_plan, '', 1)
-
-          old_reason = """    if (fullScanDue) reason = 'periodic-full-scan';
-              else if (card.cardIncomplete) reason = 'card-parse-incomplete';
-          """
-          new_reason = """    if (card.cardIncomplete) reason = 'card-parse-incomplete';
-          """
-          if old_reason not in text:
-              raise SystemExit('missing periodic-full-scan reason branch')
-          text = text.replace(old_reason, new_reason, 1)
-
-          old_return = "return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts, firstFullRun, fullScanDue };"
-          new_return = "return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts };"
-          if old_return not in text:
-              raise SystemExit('missing hybrid plan return')
-          text = text.replace(old_return, new_return, 1)
-
-          scan_state = re.compile(
-              r"\n    catalog\.lastFullDetailScanAt = \(hybridPlan\.firstFullRun \|\| hybridPlan\.fullScanDue\)\n"
-              r"      \? hybridNow\.toISOString\(\) : config\.previousState\?\.lastFullDetailScanAt \|\| null;"
+          text, count = re.subn(
+              r"  const firstFullRun = !previousState;\n"
+              r"  const lastFullScanAt = Date\.parse\(previousState\?\.lastFullDetailScanAt \|\| ''\);\n"
+              r"  const fullScanDue = Boolean\(previousState\) && \(!Number\.isFinite\(lastFullScanAt\) \|\|\n"
+              r"    now\.getTime\(\) - lastFullScanAt >= \(config\.detailFullScanIntervalMs \|\| DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS\)\);\n",
+              '', text, count=1
           )
-          text, count = scan_state.subn('', text, count=1)
+          if count != 1:
+              raise SystemExit('missing full-scan plan block')
+
+          old = "    if (fullScanDue) reason = 'periodic-full-scan';\n    else if (card.cardIncomplete) reason = 'card-parse-incomplete';"
+          new = "    if (card.cardIncomplete) reason = 'card-parse-incomplete';"
+          if old not in text:
+              raise SystemExit('missing periodic-full-scan reason branch')
+          text = text.replace(old, new, 1)
+
+          old = "return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts, firstFullRun, fullScanDue };"
+          new = "return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts };"
+          if old not in text:
+              raise SystemExit('missing hybrid plan return')
+          text = text.replace(old, new, 1)
+
+          text, count = re.subn(
+              r"\n    catalog\.lastFullDetailScanAt = \(hybridPlan\.firstFullRun \|\| hybridPlan\.fullScanDue\)\n"
+              r"      \? hybridNow\.toISOString\(\) : config\.previousState\?\.lastFullDetailScanAt \|\| null;",
+              '', text, count=1
+          )
           if count != 1:
               raise SystemExit('missing lastFullDetailScanAt persistence block')
 
-          if 'periodic-full-scan' in text or 'fullScanDue' in text or 'firstFullRun' in text:
-              raise SystemExit('full-scan execution identifiers remain in main source')
-          if text == original:
-              raise SystemExit('main source was not changed')
+          forbidden = ['DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS', 'detailFullScanIntervalMs',
+                       'periodic-full-scan', 'fullScanDue', 'firstFullRun']
+          remaining = [item for item in forbidden if item in text]
+          if remaining:
+              raise SystemExit(f'full-scan execution identifiers remain: {remaining}')
           main.write_text(text, encoding='utf-8')
 
           env_file = Path('.env.example')
-          env_text = env_file.read_text(encoding='utf-8')
-          env_text = re.sub(r'^DETAIL_FULL_SCAN_INTERVAL_MS=.*\n?', '', env_text, flags=re.M)
+          env_text = re.sub(r'^DETAIL_FULL_SCAN_INTERVAL_MS=.*\n?', '',
+                            env_file.read_text(encoding='utf-8'), flags=re.M)
           env_file.write_text(env_text, encoding='utf-8')
 
           readme = Path('README.md')
@@ -100,7 +98,7 @@ jobs:
 
           test_file = Path('test/no-automatic-full-scan.test.js')
           test_file.parent.mkdir(parents=True, exist_ok=True)
-          test_file.write_text(r"""'use strict';
+          test_file.write_text("""'use strict';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -113,7 +111,7 @@ function safeDiscovery() {
   return {
     urls: [productUrl],
     candidates: [{
-      innerText: '안전한 상품\n10,000원\n판매 중\n옵션 A (판매 중)',
+      innerText: '안전한 상품\\n10,000원\\n판매 중\\n옵션 A (판매 중)',
       hrefs: [productUrl],
       blockId: ''
     }]
@@ -125,14 +123,12 @@ test('first run does not trigger an automatic full detail scan', () => {
     notionPageUrl,
     detailFullScanIntervalMs: 1
   });
-
   assert.deepEqual(plan.detailUrls, []);
-  assert.equal(Object.values(plan.detailReasonByUrl).includes('periodic-full-scan'), false);
   assert.equal('firstFullRun' in plan, false);
   assert.equal('fullScanDue' in plan, false);
 });
 
-test('old lastFullDetailScanAt is ignored and does not select every product', () => {
+test('old lastFullDetailScanAt is ignored', () => {
   const previousState = {
     lastFullDetailScanAt: '2000-01-01T00:00:00.000Z',
     productMetadata: {},
@@ -142,14 +138,11 @@ test('old lastFullDetailScanAt is ignored and does not select every product', ()
     notionPageUrl,
     detailFullScanIntervalMs: 1
   });
-
   assert.deepEqual(plan.detailUrls, []);
-  assert.equal(Object.values(plan.detailReasonByUrl).includes('periodic-full-scan'), false);
 });
 """, encoding='utf-8')
 
-          workflow = Path('.github/workflows/remove-full-scan.yml')
-          workflow.unlink()
+          Path('.github/workflows/remove-full-scan.yml').unlink()
           PY
 
       - name: Verify removed identifiers
@@ -164,6 +157,6 @@ test('old lastFullDetailScanAt is ignored and does not select every product', ()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add notion-watcher-once.js .env.example README.md test/no-automatic-full-scan.test.js .github/workflows/remove-full-scan.yml
+          git add -A
           git commit -m "Remove automatic full detail scans [full-scan-removed]"
           git push origin HEAD:fix/remove-automatic-full-scan
