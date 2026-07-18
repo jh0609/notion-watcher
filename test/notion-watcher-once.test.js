@@ -11,7 +11,7 @@ const {
   attachPageDiagnostics, parseProductText, shouldAbortDetailResource, configureDetailResourcePolicy,
   processDetailPage, createDetailPageSlot, buildDetailContextSettings, parseProductCard, buildHybridDetailPlan,
   isUsableDetailSnapshot, shouldTripHydrationCircuitBreaker, advanceHydrationCircuitState, runOnce,
-  validateCatalogMetadata, saveStateWithLog, shouldRotateDetailSession
+  validateCatalogMetadata, saveStateWithLog, shouldRotateDetailSession, formatCatalogDiff, formatStatusLabel
 } = require('../notion-watcher-once');
 
 async function config() {
@@ -235,6 +235,27 @@ test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff
   assert.ok(changed.changes.some((item) => item.field === 'status'));
   assert.ok(changed.changes.some((item) => item.field === 'character_status'));
   assert.ok(changed.changes.some((item) => item.field === 'character_removed'));
+});
+
+test('알림의 상품 및 캐릭터 상태를 한글 라벨로 표시한다', () => {
+  assert.equal(formatStatusLabel('for_sale'), '판매 중');
+  assert.equal(formatStatusLabel('sold_out'), '품절');
+  assert.equal(formatStatusLabel('temporarily_sold_out'), '일시 품절');
+  assert.equal(formatStatusLabel('partially_sold_out'), '일부 상품 품절');
+  assert.equal(formatStatusLabel('discontinued'), '판매 종료');
+  const message = formatCatalogDiff([{
+    type: 'changed', name: '상품 A', changes: [
+      { field: 'status', before: 'for_sale', after: 'sold_out' },
+      { field: 'character_status', name: '캐릭터 A', before: 'temporarily_sold_out', after: 'for_sale' },
+      { field: 'character_added', name: '캐릭터 B', after: 'partially_sold_out' },
+      { field: 'character_removed', name: '캐릭터 C', before: 'discontinued' }
+    ]
+  }]);
+  assert.match(message, /상태: 판매 중 → 품절/);
+  assert.match(message, /캐릭터 A: 일시 품절 → 판매 중/);
+  assert.match(message, /캐릭터 추가 캐릭터 B: 일부 상품 품절/);
+  assert.match(message, /캐릭터 삭제 캐릭터 C: 판매 종료/);
+  assert.doesNotMatch(message, /for_sale|sold_out|discontinued/);
 });
 
 test('외부 링크와 실제 Notion 상품 링크가 섞여 있어도 상품 링크만 허용한다', () => {

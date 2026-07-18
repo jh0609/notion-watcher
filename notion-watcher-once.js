@@ -1098,6 +1098,17 @@ function normalizeStatus(value) {
   return text.toLowerCase();
 }
 
+function formatStatusLabel(value) {
+  const status = normalizeStatus(value);
+  return {
+    for_sale: '판매 중',
+    sold_out: '품절',
+    temporarily_sold_out: '일시 품절',
+    partially_sold_out: '일부 상품 품절',
+    discontinued: '판매 종료'
+  }[status] || normalizeValue(value) || '(없음)';
+}
+
 const CARD_OPTION_LINE_PATTERN = /^([^()（）\r\n]+?)\s*[\(（]\s*(일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)\s*[\)）]$/i;
 const CARD_STATUS_LINE_PATTERN = /^(일부\s*(?:상품\s*)?품절|일시\s*품절|판매\s*중|품절|FOR\s*SALE|SOLD\s*OUT)$/i;
 
@@ -2594,10 +2605,15 @@ function formatCatalogDiff(diff) {
   return diff.flatMap((item) => {
     const header = `${item.type === 'added' ? '추가' : item.type === 'removed' ? '삭제' : '변경'}: ${item.name || item.url}`;
     const details = item.changes.map((change) => {
-      if (change.field === 'character_status') return `- ${change.name}: ${change.before} → ${change.after}`;
-      if (change.field === 'character_added') return `- 캐릭터 추가 ${change.name}: ${change.after}`;
-      if (change.field === 'character_removed') return `- 캐릭터 삭제 ${change.name}: ${change.before}`;
+      if (change.field === 'character_status') {
+        return `- ${change.name}: ${formatStatusLabel(change.before)} → ${formatStatusLabel(change.after)}`;
+      }
+      if (change.field === 'character_added') return `- 캐릭터 추가 ${change.name}: ${formatStatusLabel(change.after)}`;
+      if (change.field === 'character_removed') return `- 캐릭터 삭제 ${change.name}: ${formatStatusLabel(change.before)}`;
       if (change.field === 'product') return '- 상품 전체';
+      if (change.field === 'status') {
+        return `- 상태: ${formatStatusLabel(change.before)} → ${formatStatusLabel(change.after)}`;
+      }
       return `- ${change.field}: ${change.before || '(없음)'} → ${change.after || '(없음)'}`;
     });
     return [header, ...details];
@@ -2922,6 +2938,7 @@ module.exports = {
   analyzeCardDetail,
   debugCards,
   formatCatalogDiff,
+  formatStatusLabel,
   sendNtfyNotification,
   dryRun,
   saveStateWithLog,
