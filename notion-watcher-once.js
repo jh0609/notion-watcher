@@ -24,7 +24,6 @@ const DEFAULT_DETAIL_SESSION_RECOVERY_MAX_RETRIES = 2;
 const DEFAULT_DETAIL_MAX_PAGES_PER_SESSION = 2;
 const DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS = 3 * 1000;
 const DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD = 1;
-const DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DETAIL_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_DEBUG_DIR = './debug';
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000;
@@ -151,7 +150,6 @@ function resolveConfig(env = process.env) {
   const detailMaxPagesPerSession = parsePositiveIntegerEnv(env, 'DETAIL_MAX_PAGES_PER_SESSION', DEFAULT_DETAIL_MAX_PAGES_PER_SESSION);
   const detailSessionRotationDelayMs = parsePositiveIntegerEnv(env, 'DETAIL_SESSION_ROTATION_DELAY_MS', DEFAULT_DETAIL_SESSION_ROTATION_DELAY_MS);
   const detailConsecutiveStallThreshold = parsePositiveIntegerEnv(env, 'DETAIL_CONSECUTIVE_STALL_THRESHOLD', DEFAULT_DETAIL_CONSECUTIVE_STALL_THRESHOLD);
-  const detailFullScanIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_FULL_SCAN_INTERVAL_MS', DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS);
   const detailRecheckIntervalMs = parsePositiveIntegerEnv(env, 'DETAIL_RECHECK_INTERVAL_MS', DEFAULT_DETAIL_RECHECK_INTERVAL_MS);
 
   if (!Number.isFinite(minTextLength) || minTextLength < 1) {
@@ -191,7 +189,6 @@ function resolveConfig(env = process.env) {
     detailMaxPagesPerSession,
     detailSessionRotationDelayMs,
     detailConsecutiveStallThreshold,
-    detailFullScanIntervalMs,
     detailRecheckIntervalMs,
     staleLockMs,
     pageLoadTimeoutMs,
@@ -1220,7 +1217,7 @@ function parseProductCard(candidate, mainUrl) {
   return { ...stableCard, cardHash: createHash(JSON.stringify(stableCard)), requiresDetail, rawText };
 }
 
-function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
+function buildHybridDetailPlan(discovery, previousState, config = {}) {
   const cardsByUrl = new Map();
   for (const candidate of discovery.candidates || []) {
     const card = parseProductCard(candidate, config.notionPageUrl);
@@ -1228,10 +1225,6 @@ function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
   }
   const previousMetadata = previousState?.productMetadata || {};
   const previousProducts = new Map((previousState?.catalog?.products || []).map((product) => [product.url, product]));
-  const firstFullRun = !previousState;
-  const lastFullScanAt = Date.parse(previousState?.lastFullDetailScanAt || '');
-  const fullScanDue = Boolean(previousState) && (!Number.isFinite(lastFullScanAt) ||
-    now.getTime() - lastFullScanAt >= (config.detailFullScanIntervalMs || DEFAULT_DETAIL_FULL_SCAN_INTERVAL_MS));
   const cards = discovery.urls.map((url) => cardsByUrl.get(url) || {
     url, name: '', price: '', status: '', characters: [], visibleVariantCount: 0,
     totalVariantCount: 0, cardIncomplete: true, requiresDetail: true,
@@ -1242,8 +1235,7 @@ function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
     const previous = previousMetadata[card.url];
     const pageId = extractNotionPageId(card.url, card.url);
     let reason = '';
-    if (fullScanDue) reason = 'periodic-full-scan';
-    else if (card.cardIncomplete) reason = 'card-parse-incomplete';
+    if (card.cardIncomplete) reason = 'card-parse-incomplete';
     else if (ANALYSIS_UNKNOWN_PAGE_IDS.has(pageId)) reason = 'unknown-analysis';
     else if (previous?.knownHiddenVariants || Number(previous?.totalVariantCount || 0) > card.visibleVariantCount) {
       reason = 'known-hidden-variants';
@@ -1251,7 +1243,7 @@ function buildHybridDetailPlan(discovery, previousState, now, config = {}) {
     if (reason) detailReasonByUrl[card.url] = reason;
     return Boolean(reason);
   }).map((card) => card.url);
-  return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts, firstFullRun, fullScanDue };
+  return { cards, detailUrls, detailReasonByUrl, previousMetadata, previousProducts };
 }
 
 function serializeCatalog(catalog) {
@@ -1915,7 +1907,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
   }
 
   const hybridNow = config.hybridNow instanceof Date ? config.hybridNow : new Date();
-  const hybridPlan = buildHybridDetailPlan(discovery, config.previousState, hybridNow, { ...config, notionPageUrl });
+  const hybridPlan = buildHybridDetailPlan(discovery, config.previousState, { ...config, notionPageUrl });
   const urls = hybridPlan.detailUrls;
   const buildHybridResult = (detailProducts) => {
     const detailsByUrl = new Map(detailProducts.filter(Boolean).map((product) => [canonicalizeUrl(product.url, product.url), product]));
@@ -1972,8 +1964,6 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     });
     const catalog = validateCatalogMetadata(normalizeCatalog(combined));
     catalog.productMetadata = metadata;
-    catalog.lastFullDetailScanAt = (hybridPlan.firstFullRun || hybridPlan.fullScanDue)
-      ? hybridNow.toISOString() : config.previousState?.lastFullDetailScanAt || null;
     const reasons = Object.values(hybridPlan.detailReasonByUrl);
     catalog.hybridSummary = {
       totalProducts: hybridPlan.cards.length,
@@ -2027,7 +2017,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
       }
     }
     const reusePages = config.detailReusePages !== false;
-    log('INFO', `전체 상세 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
+    log('INFO', `상세 대상 조회 시작: URL ${urls.length}개, 동시성 ${detailConcurrency}`);
     let cursor = 1;
     const retryQueue = [];
     const hydrationResumeQueue = [];
@@ -2078,7 +2068,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
               const pending = hydrationResumeQueue.splice(0);
               pending.forEach((index) => failures.push({ url: urls[index], reason: 'hydration stall' }));
               traversalAborted = true;
-              log('ERROR', `복구 한도 초과로 전체 상세 순회 중단: 실패 지점=${pending[0] + 1}/${urls.length}, 남은 상품=${pending.length}`);
+              log('ERROR', `복구 한도 초과로 상세 대상 순회 중단: 실패 지점=${pending[0] + 1}/${urls.length}, 남은 상품=${pending.length}`);
               break;
             } else {
             await pageSlot.discard();
@@ -2176,7 +2166,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
                       .forEach((pendingIndex) => failures.push({ url: urls[pendingIndex], reason: 'hydration stall' }));
                     hydrationResumeQueue.length = 0;
                     const remainingCount = retryQueue.length + (urls.length - cursor);
-                    log('ERROR', `복구 한도 초과로 전체 상세 순회 중단: 실패 지점=${position}/${urls.length}, 남은 상품=${remainingCount}`);
+                    log('ERROR', `복구 한도 초과로 상세 대상 순회 중단: 실패 지점=${position}/${urls.length}, 남은 상품=${remainingCount}`);
                     break;
                   }
                   await closeDetailBrowserSession(detailSession);
@@ -2227,7 +2217,7 @@ async function fetchProductCatalog(notionPageUrl, config = {}) {
     await Promise.all(Array.from({ length: detailConcurrency }, (_, index) => worker(index)));
     const elapsedMs = Date.now() - detailStartedAt;
     const averageMs = detailDurationsMs.length ? detailDurationsMs.reduce((sum, value) => sum + value, 0) / detailDurationsMs.length : 0;
-    log('INFO', `전체 상세 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초, 상품 평균 ${(averageMs / 1000).toFixed(1)}초`);
+    log('INFO', `상세 대상 조회 완료: 성공 ${products.filter(Boolean).length}개, 실패 ${failures.length}개, 소요시간 ${(elapsedMs / 1000).toFixed(1)}초, 상품 평균 ${(averageMs / 1000).toFixed(1)}초`);
     if (failures.length) {
       const error = new PageFetchError('product detail fetch failed', failures.map((item) => item.url).join(', '));
       error.failures = failures;
@@ -2306,7 +2296,7 @@ async function diagnoseSingleDetail(config = resolveSingleDetailConfig()) {
 }
 
 async function diagnoseMainToDetailTransition(config = resolveTransitionDiagnosticConfig()) {
-  log('INFO', '메인→상세 통합 진단은 npm start와 동일한 전체 상세 파이프라인을 사용합니다.');
+  log('INFO', '메인→상세 통합 진단은 npm start와 동일한 상세 조회 파이프라인을 사용합니다.');
   const catalog = await fetchProductCatalog(config.notionPageUrl, config);
   log('INFO', `메인→상세 통합 진단 성공: 상품 ${catalog.products.length}개`);
   return catalog;
@@ -2668,7 +2658,6 @@ async function runOnce(options = {}) {
       });
       hybridState = {
         productMetadata: fetched.productMetadata || previousState?.productMetadata || {},
-        lastFullDetailScanAt: fetched.lastFullDetailScanAt || previousState?.lastFullDetailScanAt || null,
         hybridSummary: fetched.hybridSummary || null
       };
       catalog = validateCatalogMetadata(normalizeCatalog(fetched));
@@ -2680,7 +2669,7 @@ async function runOnce(options = {}) {
           await deps.sendOperatorNotification(
             config,
             'Notion watcher 최초 기준 스캔 실패',
-            `전체 상세 조회가 불완전하여 신규 기준 state를 생성하지 않았습니다.\n실패 이유: ${fetchError.reason}`
+            `필수 상세 대상 조회가 불완전하여 신규 기준 state를 생성하지 않았습니다.\n실패 이유: ${fetchError.reason}`
           );
           log('INFO', '최초 기준 스캔 실패 관리자 알림을 전송했습니다.');
         } catch (alertError) {
@@ -2702,6 +2691,8 @@ async function runOnce(options = {}) {
     const json = serializeCatalog(catalog);
     const hash = createHash(json);
     const checkedAt = deps.now().toISOString();
+    const stateToCarryForward = { ...previousState };
+    delete stateToCarryForward.lastFullDetailScanAt;
 
     if (!previousState) {
       await saveStateWithLog(config.stateFile, {
@@ -2718,7 +2709,7 @@ async function runOnce(options = {}) {
 
     if (previousState.hash === hash) {
       await saveStateWithLog(config.stateFile, {
-        ...previousState,
+        ...stateToCarryForward,
         hash,
         catalog,
         ...hybridState,
@@ -2735,7 +2726,7 @@ async function runOnce(options = {}) {
 
     if (diff.length === 0) {
       await saveStateWithLog(config.stateFile, {
-        ...previousState,
+        ...stateToCarryForward,
         hash,
         catalog,
         ...hybridState,

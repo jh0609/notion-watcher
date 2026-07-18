@@ -89,27 +89,24 @@ test('변경 없는 작은 카드는 6시간 전까지 이전 상세 옵션을 �
   const card = parseProductCard(candidate, mainUrl);
   const checkedAt = '2026-07-17T00:00:00.000Z';
   const previousState = {
-    lastFullDetailScanAt: checkedAt,
     productMetadata: { [card.url]: {
       cardHash: card.cardHash, totalVariantCount: 1, lastDetailCheckedAt: checkedAt,
       fullVariants: [{ name: '가', status: 'for_sale' }]
     } },
     catalog: { products: [] }
   };
-  const plan = buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState,
-    new Date('2026-07-17T01:00:00.000Z'), {
-      notionPageUrl: mainUrl, detailFullScanIntervalMs: 21_600_000, detailRecheckIntervalMs: 21_600_000
-    });
+  const plan = buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState, {
+    notionPageUrl: mainUrl, detailRecheckIntervalMs: 21_600_000
+  });
   assert.deepEqual(plan.detailUrls, []);
 });
 
 function hybridPlanForCandidate(candidate, previousState = null) {
   const mainUrl = 'https://shop.notion.site/catalog';
   const card = parseProductCard(candidate, mainUrl);
-  return buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState,
-    new Date('2026-07-17T01:00:00.000Z'), {
-      notionPageUrl: mainUrl, detailFullScanIntervalMs: 86_400_000
-    });
+  return buildHybridDetailPlan({ urls: [card.url], candidates: [candidate] }, previousState, {
+    notionPageUrl: mainUrl
+  });
 }
 
 test('포인트 키캡 visible=2이고 파싱이 완전하면 최초 실행에서도 상세를 생략한다', () => {
@@ -140,7 +137,7 @@ test('이전 totalVariantCount가 현재 visibleVariantCount보다 크면 상세
     hrefs: ['/5273f4a9f62683e5b87581c092c3aff2'], blockId: '', pageId: ''
   };
   const card = parseProductCard(candidate, 'https://shop.notion.site/catalog');
-  const previous = { lastFullDetailScanAt: '2026-07-17T00:00:00.000Z', productMetadata: {
+  const previous = { productMetadata: {
     [card.url]: { totalVariantCount: 2, visibleVariantCount: 1, knownHiddenVariants: true }
   }, catalog: { products: [] } };
   const plan = hybridPlanForCandidate(candidate, previous);
@@ -178,12 +175,52 @@ test('최초 실행의 검증된 34개 분포는 card-only 29, visible-limit 4, 
   candidates.push({ innerText: '로맨스 판타지 캐릭터 아크릴 스탠드\n19,000원\n판매 중', optionRowTexts: [],
     hrefs: ['/39f3f4a9f6268046b716ee5e88e71956'] });
   const urls = candidates.map((candidate) => resolveCardProductUrl(candidate, mainUrl).url);
-  const plan = buildHybridDetailPlan({ urls, candidates }, null, new Date('2026-07-17T00:00:00Z'), { notionPageUrl: mainUrl });
+  const plan = buildHybridDetailPlan({ urls, candidates }, null, { notionPageUrl: mainUrl });
   const reasons = Object.values(plan.detailReasonByUrl);
   assert.equal(plan.cards.length - plan.detailUrls.length, 29);
   assert.equal(reasons.filter((reason) => reason === 'visible-limit-reached').length, 4);
   assert.equal(reasons.filter((reason) => reason === 'unknown-analysis').length, 1);
   assert.equal(plan.detailUrls.length, 5);
+});
+
+test('레거시 전체 스캔 시각과 환경변수 값이 있어도 전체 상세 조회가 재발하지 않는다', () => {
+  const mainUrl = 'https://shop.notion.site/catalog';
+  const candidates = [];
+  for (let index = 0; index < 29; index += 1) {
+    const id = `${index + 1}`.padStart(32, '0');
+    candidates.push({ innerText: `카드 상품 ${index}\n10,000원\n판매 중`, optionRowTexts: [], hrefs: [`/${id}`] });
+  }
+  for (let index = 0; index < 4; index += 1) {
+    const id = `${100 + index}`.padStart(32, '0');
+    const rows = ['가', '나', '다', '라', '마', '바'].map((name) => `${name} (판매 중)`);
+    candidates.push({ innerText: `상세 상품 ${index}\n10,000원\n판매 중\n${rows.join('\n')}`,
+      optionRowTexts: rows, hrefs: [`/${id}`] });
+  }
+  candidates.push({ innerText: '로맨스 판타지 캐릭터 아크릴 스탠드\n19,000원\n판매 중', optionRowTexts: [],
+    hrefs: ['/39f3f4a9f6268046b716ee5e88e71956'] });
+  const urls = candidates.map((candidate) => resolveCardProductUrl(candidate, mainUrl).url);
+
+  for (const lastFullDetailScanAt of ['2026-07-18T00:00:00.000Z', '2020-01-01T00:00:00.000Z']) {
+    const plan = buildHybridDetailPlan({ urls, candidates }, {
+      lastFullDetailScanAt,
+      productMetadata: {},
+      catalog: { products: [] }
+    }, { notionPageUrl: mainUrl, detailFullScanIntervalMs: 1 });
+    assert.equal(plan.detailUrls.length, 5);
+    assert.equal(plan.detailUrls.length < plan.cards.length, true);
+    assert.equal(Object.values(plan.detailReasonByUrl).includes('periodic-full-scan'), false);
+    assert.equal('firstFullRun' in plan, false);
+    assert.equal('fullScanDue' in plan, false);
+  }
+});
+
+test('DETAIL_FULL_SCAN_INTERVAL_MS는 더 이상 config로 파싱하지 않는다', () => {
+  const cfg = resolveConfig({
+    NOTION_PAGE_URL: 'https://shop.notion.site/catalog',
+    NTFY_SERVER_URL: 'https://ntfy.test', NTFY_TOPIC: 'topic', NTFY_TOKEN: 'token',
+    DETAIL_FULL_SCAN_INTERVAL_MS: '1'
+  });
+  assert.equal('detailFullScanIntervalMs' in cfg, false);
 });
 
 test('추가, 삭제, 상품 상태와 캐릭터 상태를 상품 단위로 diff한다', () => {
@@ -704,7 +741,8 @@ test('저장 해시만 달라지고 상품 diff가 비어 있으면 공개 알�
     hash: 'metadata-only-old-hash',
     catalog: previousCatalog,
     checkedAt: 'old',
-    changedAt: '2026-07-16T00:00:00.000Z'
+    changedAt: '2026-07-16T00:00:00.000Z',
+    lastFullDetailScanAt: '2020-01-01T00:00:00.000Z'
   }));
   let notificationCount = 0;
   const exitCode = await runOnce({ config: cfg, deps: {
@@ -718,6 +756,7 @@ test('저장 해시만 달라지고 상품 diff가 비어 있으면 공개 알�
   assert.equal(notificationCount, 0);
   assert.notEqual(saved.hash, 'metadata-only-old-hash');
   assert.equal(saved.changedAt, '2026-07-16T00:00:00.000Z');
+  assert.equal('lastFullDetailScanAt' in saved, false);
   await assert.rejects(fs.access(cfg.snapshotDir), { code: 'ENOENT' });
 });
 
